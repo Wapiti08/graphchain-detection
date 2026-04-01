@@ -1,11 +1,11 @@
-# configs/synthchain_ioc_config.py
+# config/synthchain_sources.py
 
 SYNTHCHAIN_IOC_CONFIG = {
     # SC1: Steganography PyPI attack (colorsapi) — Windows
     # Ground truth: azure_events (465), azure_conn (141), azure_process (42)
     # Total IOCs: 648
     "sc1": {
-        "root": "data/SynthChain/sc1",
+        "root": "data/SynthChain/sanidata/sc1",
         "logs": {
             "azure_events": {
                 "filename": "windows/azure_events.csv",
@@ -35,7 +35,7 @@ SYNTHCHAIN_IOC_CONFIG = {
     # Ground truth: all IOCs in azure_events only
     # Total IOCs: ~141 (51 pkg + 3 attack_ip + 10 exfil + 656 inject + auxiliaries)
     "sc2": {
-        "root": "data/SynthChain/sc2",
+        "root": "data/SynthChain/sanidata/sc2",
         "logs": {
             "azure_events": {
                 "filename": "azure_events.csv",
@@ -51,7 +51,7 @@ SYNTHCHAIN_IOC_CONFIG = {
     # Ground truth: eve.json (213), azure_syslog (14), zeek_conn (96), zeek_dns (6), zeek_http (4)
     # Total IOCs: 534
     "sc3": {
-        "root": "data/SynthChain/sc3",
+        "root": "data/SynthChain/sanidata/sc3",
         "logs": {
             "eve": {
                 "filename": "eve.json",
@@ -95,7 +95,7 @@ SYNTHCHAIN_IOC_CONFIG = {
     # Ground truth: eve.json (203), azure_syslog (26), zeek_conn (6), zeek_dns (4), zeek_ssl (3)
     # Total IOCs: 242
     "sc4": {
-        "root": "data/SynthChain/sc4",
+        "root": "data/SynthChain/sanidata/sc4",
         "logs": {
             "eve": {
                 "filename": "eve.json",
@@ -139,7 +139,7 @@ SYNTHCHAIN_IOC_CONFIG = {
     # Ground truth: all IOCs in azure_events
     # Total IOCs: 503 (21 download + 117 install_chain_1st + 402 install_chain_2nd + 326 c:\tt\ + 71 IMDS)
     "sc5": {
-        "root": "data/SynthChain/sc5",
+        "root": "data/SynthChain/sanidata/sc5",
         "logs": {
             "azure_events": {
                 "filename": "azure_events.csv",
@@ -155,7 +155,7 @@ SYNTHCHAIN_IOC_CONFIG = {
     # Ground truth: all IOCs in azure_events
     # Total IOCs: 392
     "sc6": {
-        "root": "data/SynthChain/sc6",
+        "root": "data/SynthChain/sanidata/sc6",
         "logs": {
             "azure_events": {
                 "filename": "victim/azure_events.csv",
@@ -171,7 +171,7 @@ SYNTHCHAIN_IOC_CONFIG = {
     # Ground truth: eve.json (201), azure_syslog (4), zeek_conn (155), zeek_dns (4), zeek_http (77), zeek_files (77)
     # Total IOCs: 510
     "sc7": {
-        "root": "data/SynthChain/sc7",
+        "root": "data/SynthChain/sanidata/sc7",
         "logs": {
             "eve": {
                 "filename": "eve.json",
