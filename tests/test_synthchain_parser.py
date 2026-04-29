@@ -21,21 +21,21 @@ class TestSynthChainParsers(unittest.TestCase):
     def test_sc1_ioc_logs_parse(self) -> None:
         # sc1 uses Azure CSVs; keep limits small for fast tests
         events = load_synthchain_events(
-            "sc1", project_root=self.repo_root, only_ioc_logs=True, limit_per_file=50
+            "sc1", project_root=self.repo_root, only_ioc_logs=True, limit_per_file=300
         )
-        print(events)
         self.assertGreater(len(events), 0)
         for e in events[:20]:
             self._assert_event_basic(e)
         # Expect at least one CONNECT from azure_conn
         self.assertTrue(any(e.edge_type == EdgeType.CONNECT for e in events))
+        # Expect at least one IOC match
+        self.assertGreater(sum(1 for e in events if e.edge_attrs.get("is_ioc")), 0)
 
     def test_sc3_ioc_logs_parse(self) -> None:
         # sc3 includes zeek CSVs and eve.json; use tiny limit per file
         events = load_synthchain_events(
             "sc3", project_root=self.repo_root, only_ioc_logs=True, limit_per_file=30
         )
-        print(events)
 
         self.assertGreater(len(events), 0)
         for e in events[:20]:

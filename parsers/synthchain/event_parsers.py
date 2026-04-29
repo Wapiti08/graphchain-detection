@@ -1,16 +1,8 @@
-'''
- # @ Create Time: 2026-03-31 15:31:45
- # @ Modified time: 2026-04-01 11:13:46
- # @ Description: define the parsing logic for diverse log/csv to extract desired entities in order
- to construct the (temporal) heterogenous graph
- '''
 from __future__ import annotations
-import sys
-from pathlib import Path
-
-sys.path.insert(0, Path.cwd().parent.parent.as_posix())
 
 import json
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import pandas as pd
@@ -18,7 +10,8 @@ import pandas as pd
 from config.ontology import EdgeType, NodeType, canonical_edge_attrs, fill_defaults
 from config.synthchain_sources import SYNTHCHAIN_IOC_CONFIG
 from parsers.events import EntityRef, Event, parse_csv_list, safe_float, safe_int
-from utils.parse_helpers import extract_ips_and_paths, parse_ts_to_unix_seconds
+from parsers.extractors import extract_ips_and_paths, extract_text_signals, suspicious_cmd_flags
+from parsers.normalizers import IOCIndex, load_ioc_ground_truth, parse_ts_to_unix_seconds
 from utils.synthchain_helpers import (
     file_key,
     host_prefix,
@@ -89,7 +82,15 @@ def parse_azure_process_df(df: pd.DataFrame, scenario_id: str) -> List[Event]:
         child = EntityRef(NodeType.PROC, proc_key(prefix, str(proc_id) if proc_id is not None else None, str(proc_name) if proc_name is not None else None))
 
         cmdline = row.get("CommandLine") or ""
-        edge_attrs = fill_defaults(canonical_edge_attrs(EdgeType.EXEC), {"cmdline": str(cmdline)})
+        cmd = str(cmdline)
+        edge_attrs = fill_defaults(
+            canonical_edge_attrs(EdgeType.EXEC),
+            {
+                "cmdline": cmd,
+                **suspicious_cmd_flags(cmd),
+                **extract_text_signals(cmd),
+            },
+        )
         events.append(
             Event(
                 edge_type=EdgeType.EXEC,
@@ -120,6 +121,8 @@ def parse_azure_events_df(df: pd.DataFrame, scenario_id: str) -> List[Event]:
 
         msg = str(row.get("RenderedDescription") or row.get("Message") or "")
         ips, paths = extract_ips_and_paths(msg)
+        txt_signals = extract_text_signals(msg)
+        cmd_flags = suspicious_cmd_flags(msg)
 
         # IPs -> CONNECT
         for ip in ips[:5]:
@@ -133,7 +136,14 @@ def parse_azure_events_df(df: pd.DataFrame, scenario_id: str) -> List[Event]:
                     order=i,
                     edge_attrs=fill_defaults(
                         canonical_edge_attrs(EdgeType.CONNECT),
-                        {"bytes_sent": 0, "bytes_recv": 0, "direction": "unknown", "evidence": msg[:500]},
+                        {
+                            "bytes_sent": 0,
+                            "bytes_recv": 0,
+                            "direction": "unknown",
+                            "evidence": msg[:500],
+                            **txt_signals,
+                            **cmd_flags,
+                        },
                     ),
                     raw={"log": "azure_events", "scenario": scenario_id},
                 )
@@ -149,7 +159,10 @@ def parse_azure_events_df(df: pd.DataFrame, scenario_id: str) -> List[Event]:
                     dst=dst,
                     ts=ts,
                     order=i,
-                    edge_attrs=fill_defaults(canonical_edge_attrs(EdgeType.WRITE), {"bytes": 0, "evidence": msg[:500]}),
+                    edge_attrs=fill_defaults(
+                        canonical_edge_attrs(EdgeType.WRITE),
+                        {"bytes": 0, "evidence": msg[:500], **txt_signals, **cmd_flags},
+                    ),
                     raw={"log": "azure_events", "scenario": scenario_id},
                 )
             )
@@ -172,6 +185,8 @@ def parse_azure_syslog_df(df: pd.DataFrame, scenario_id: str) -> List[Event]:
         proc_name = row.get("ProcessName")
         child = EntityRef(NodeType.PROC, proc_key(prefix, None, str(proc_name) if proc_name is not None else None))
         msg = str(row.get("SyslogMessage") or "")
+        txt_signals = extract_text_signals(msg)
+        cmd_flags = suspicious_cmd_flags(msg)
 
         events.append(
             Event(
@@ -180,7 +195,10 @@ def parse_azure_syslog_df(df: pd.DataFrame, scenario_id: str) -> List[Event]:
                 dst=child,
                 ts=ts,
                 order=i,
-                edge_attrs=fill_defaults(canonical_edge_attrs(EdgeType.EXEC), {"cmdline": msg}),
+                edge_attrs=fill_defaults(
+                    canonical_edge_attrs(EdgeType.EXEC),
+                    {"cmdline": msg, **txt_signals, **cmd_flags},
+                ),
                 raw={"log": "azure_syslog", "scenario": scenario_id},
             )
         )
@@ -428,6 +446,7 @@ def load_synthchain_events(
     project_root: str | Path,
     only_ioc_logs: bool = True,
     limit_per_file: Optional[int] = None,
+    ioc_ground_truth_path: str | Path | None = "data/SynthChain/iocs/ioc_ground_truth.json",
 ) -> List[Event]:
     """
     Load and parse SynthChain logs for a scenario based on SYNTHCHAIN_IOC_CONFIG.
@@ -476,6 +495,99 @@ def load_synthchain_events(
 
         elif path.suffix.lower() == ".json" and path.name == "eve.json":
             out.extend(parse_eve_json_lines(path, scenario_id, limit=limit_per_file))
+
+    # IOC annotation (optional)
+    if ioc_ground_truth_path is not None:
+        gt_path = Path(project_root) / ioc_ground_truth_path
+        if gt_path.exists():
+            idx_by_scenario = load_ioc_ground_truth(gt_path)
+            idx = idx_by_scenario.get(scenario_id)
+            if idx is not None:
+                out = annotate_events_with_iocs(out, idx)
+
+    return out
+
+
+def _event_ioc_tokens(ev: Event) -> List[str]:
+    """
+    Extract a small set of candidate strings to match against IOC values.
+    We avoid scanning the whole message to keep it cheap.
+    """
+    tokens: List[str] = []
+
+    def add(s: Any) -> None:
+        if s is None:
+            return
+        t = str(s).strip().lower()
+        if not t:
+            return
+        tokens.append(t)
+
+    add(ev.src.key)
+    add(ev.dst.key)
+
+    # split compound keys (ip:port, domain|ip:port, etc.)
+    for base in list(tokens):
+        for sep in ("|", ":", "/", "\\"):
+            if sep in base:
+                for part in base.split(sep):
+                    add(part)
+
+    # Also match common text fields if present.
+    add(ev.edge_attrs.get("cmdline"))
+    add(ev.edge_attrs.get("evidence"))
+
+    # From evidence/cmdline, extract IPs and file paths (high-value keys).
+    txt = " ".join([str(ev.edge_attrs.get("cmdline") or ""), str(ev.edge_attrs.get("evidence") or "")])
+    if txt.strip():
+        ips, paths = extract_ips_and_paths(txt)
+        for ip in ips[:10]:
+            add(ip)
+        for p in paths[:10]:
+            add(p)
+
+    # de-dup preserve order
+    seen: set[str] = set()
+    out: List[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def annotate_events_with_iocs(events: List[Event], idx: IOCIndex, *, max_values: int = 5) -> List[Event]:
+    """
+    Add IOC match metadata into edge_attrs:
+    - is_ioc: bool
+    - ioc_types: list[str]
+    - ioc_values: list[str] (truncated)
+    """
+    out: List[Event] = []
+    values = idx.values
+    types_by_value = idx.types_by_value
+
+    for ev in events:
+        hits: List[str] = []
+        hit_types: set[str] = set()
+        for tok in _event_ioc_tokens(ev):
+            if tok in values:
+                hits.append(tok)
+                hit_types |= set(types_by_value.get(tok, set()))
+                if len(hits) >= max_values:
+                    break
+
+        if hits:
+            ea = dict(ev.edge_attrs)
+            ea["is_ioc"] = True
+            ea["ioc_values"] = hits
+            ea["ioc_types"] = sorted(hit_types) if hit_types else []
+            out.append(replace(ev, edge_attrs=ea))
+        else:
+            ea = dict(ev.edge_attrs)
+            if "is_ioc" not in ea:
+                ea["is_ioc"] = False
+            out.append(replace(ev, edge_attrs=ea))
 
     return out
 
