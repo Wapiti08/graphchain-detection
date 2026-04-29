@@ -3,59 +3,109 @@ detection of ongoing supply chain vulnerabilities with temporal graph neural net
 
 ## Data Processing (Feature Extraction)
 
-- Unified Entity Ontology:
+### Unified Entity Ontology
 
-    - Unified Node Types (6) with attributes:
+The canonical graph schema is based on HetHunt's heterogeneous runtime graph and extended with the IoC entities observed in the SynthChain scenarios. The goal is to keep the graph explainable while avoiding one-off node types for every raw log field.
 
-        - PROC --- process: install script, subprocess, python interpreter
-            - attr1: is_lolbin (Living Off the Land Binaries) - bitsadmin, powershell
+#### Node Types
 
-            - attr2: parent_depth - Docker → Python → payload chain depth (benign is within 2-3, deeper means more suspicious)
+- `PKG` --- package identity and dependency unit.
+    - attrs: `ecosystem`, `name`, `version`, `registry`, `is_direct_dependency`
 
-        - FILE --- file system entity: file(path) be read/created/wrote/delete
-            - attr1: path_sensitivity - Writing to the Startup folder = Persistence
+- `PROC` --- process/runtime entity, including install scripts, subprocesses, interpreters, LOLBins, build jobs, and container entrypoints.
+    - attrs: `proc_name`, `pid`, `ppid`, `cmdline`, `user`, `working_dir`, `image_path`, `is_lolbin`, `parent_depth`
 
-            - attr2: file_type - .png hidden payload (steganography)
+- `CMD` --- command string or shell action invoked by a process.
+    - attrs: `command`, `interpreter`, `args`, `shell`, `encoded`, `is_obfuscated`
 
-        - NET --- network endpoint: IP:port or domain names
-            - attr1: port - Sc4: 2121/50000 = FTP; Sc6: 8081 = exfil
+- `FILE` --- file-system entity that can be read, written, deleted, packed, or staged.
+    - attrs: `path`, `file_type`, `mime_type`, `size`, `hash_md5`, `hash_sha1`, `hash_sha256`, `path_sensitivity`, `is_archive`, `is_model_artifact`
 
-            - attr2: is_known_registry - Sc4/5: npm registry vs unknown IP
+- `NET` --- network endpoint, including IPs, domains, URLs, and service ports.
+    - attrs: `ip`, `domain`, `url`, `port`, `protocol`, `service`, `is_known_registry`, `tls_valid`, `tls_version`, `cipher`, `server_name`, `sni_matches_cert`, `validation_status`
 
-            - attr3: tls_valid - Sc5: self-signed cert, no SNI
+- `HOST` --- machine, VM, container, or attacker/victim environment.
+    - attrs: `hostname`, `host_ip`, `os`, `role`, `cloud_provider`, `container_id`
 
-        - SYSCALL --- behavior type node
+- `USER` --- local, cloud, package-registry, or service account identity.
+    - attrs: `username`, `domain`, `account_type`, `privilege_level`
 
-        - PKG --- package: current packages with their dependencies
+- `CRED` --- token, password, API key, cloud secret, or credential-like material.
+    - attrs: `cred_type`, `provider`, `scope`, `is_secret_leak`
 
-        - CRED --- token/secret/crediential
-            - attr1: cred_type - Sc5: token; Sc6: Azure key; Sc2: password
+- `ARTIFACT` --- supply-chain artifact such as wheel/tarball/npm package, build zip, executable, model file, or container image.
+    - attrs: `artifact_type`, `name`, `version`, `hash_md5`, `hash_sha256`, `source`, `signed`, `signature_valid`
 
+- `SYSCALL` --- system call or low-level behavior type.
+    - attrs: `name`, `category`
 
-    - Unified Edge Types with attributes (12):
+- `ALERT` --- detection or IDS signal such as Suricata alert signatures and MITRE/TTP labels.
+    - attrs: `signature`, `category`, `severity`, `mitre_technique`, `confidence`
 
-        EXEC (cmdline):     PROC -> PROC :   cover initial execution, subprocess creation
+#### Edge Types
 
-        READ (bytes):     PROC -> FILE:    information collection
+- `DEPEND`: `PKG -> PKG`
+    - attrs: `version_constraint`, `dependency_type`
 
-        WRITE (bytes):    PROC -> FILE:    persistence
+- `LOAD`: `PKG -> PROC`
+    - attrs: `entry_point`, `phase`
 
-        CONNECT (bytes_sent, bytes_recv, direction):  PROC -> NET:     network connection
+- `EXEC`: `PROC -> PROC`, `PROC -> CMD`, `HOST -> PROC`
+    - attrs: `cmdline`, `args`, `exit_code`, `phase`
 
-        INVOKE (args, return_val):   PROC -> SYSCALL: system call
+- `INVOKE`: `PROC -> SYSCALL`
+    - attrs: `args`, `return_val`
 
-        DEPEND (version_constraint):   PKG -> PKG:      dependency
+- `READ`: `PROC -> FILE`
+    - attrs: `bytes`, `operation`, `evidence`
 
-        LOAD (entry_point):     PKG -> PROC:     package invoke execution
+- `WRITE`: `PROC -> FILE`
+    - attrs: `bytes`, `operation`, `evidence`
 
-        REDIRECT (http_status): NET -> NET:      http redirected
+- `DELETE`: `PROC -> FILE`
+    - attrs: `operation`, `evidence`
 
-        RESOLVE (resolved_ip):  NET -> NET:      DNS resolve
+- `CONNECT`: `PROC -> NET`, `HOST -> NET`
+    - attrs: `bytes_sent`, `bytes_recv`, `direction`, `duration`, `protocol`, `service`
 
-        RELAY (\delta t):    NET -> NET:      Proxy/multi-hop transfer
+- `DNS_QUERY`: `PROC -> NET`
+    - attrs: `query_domain`, `query_type`, `rcode`, `answers`, `ttls`
 
-        INJECT (injection_type):   PROC -> PROC:    inject code in process
+- `RESOLVE`: `NET -> NET`
+    - attrs: `resolved_ip`
 
-        DNS_QUERY (query_domain): PROC -> NET:     who raises dns query
+- `REDIRECT`: `NET -> NET`
+    - attrs: `http_status`, `location`
 
-    - 
+- `RELAY`: `NET -> NET`
+    - attrs: `delta_t`, `hop_count`
+
+- `EXFILTRATE`: `PROC -> NET`, `FILE -> NET`
+    - attrs: `bytes_sent`, `channel`, `archive_type`, `evidence`
+
+- `INJECT`: `PROC -> PROC`, `PROC -> ARTIFACT`
+    - attrs: `injection_type`, `target`, `phase`
+
+- `AUTHENTICATE`: `USER -> HOST`, `USER -> NET`, `PROC -> NET`
+    - attrs: `auth_method`, `success`, `credential_type`
+
+- `USES_CRED`: `PROC -> CRED`, `USER -> CRED`
+    - attrs: `usage`, `provider`, `scope`
+
+- `HOSTS`: `HOST -> NET`, `HOST -> PROC`
+    - attrs: `port`, `service`, `listen_state`
+
+- `GENERATES`: `PROC -> ARTIFACT`, `PKG -> ARTIFACT`
+    - attrs: `phase`, `tool`, `hash_sha256`
+
+- `TRIGGERS`: `ARTIFACT -> PROC`, `CMD -> PROC`, `ALERT -> PROC`
+    - attrs: `trigger_type`, `condition`, `evidence`
+
+#### Common Event Attributes
+
+- Temporal attrs: `ts`, `order`, `phase`, `duration`
+- Provenance attrs: `scenario_id`, `log_source`, `raw_type`, `event_id`, `flow_id`, `uid`
+- IoC attrs: `ioc_label`, `confidence`, `threat_type`, `mitre_technique`
+- HTTP attrs: `method`, `uri`, `status_code`, `status_msg`, `user_agent`, `resp_bytes`
+- TLS attrs: `server_name`, `cipher`, `tls_version`, `sni_matches_cert`, `validation_status`
+- DNS attrs: `query_domain`, `query_type`, `answers`, `rcode`
