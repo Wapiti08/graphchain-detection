@@ -56,6 +56,24 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Output filename stem override (no extension).",
     )
+    p.add_argument(
+        "--causal",
+        type=str,
+        default="off",
+        choices=["off", "level0", "level1"],
+        help="Add deterministic causal dependency edges.",
+    )
+    p.add_argument(
+        "--causal-window",
+        type=float,
+        default=50.0,
+        help="Causal window in seconds (if ts) or steps (if no ts).",
+    )
+    p.add_argument(
+        "--export-tgn",
+        action="store_true",
+        help="Also export a flattened TGN-style event stream (.tgn.pt).",
+    )
     return p.parse_args()
 
 
@@ -124,6 +142,15 @@ def main() -> None:
 
             stem = args.name or f"qut_{args.qut_kind}"
 
+    if args.causal != "off":
+        from graph.augment import augment_events_with_causal
+
+        events = augment_events_with_causal(
+            events,
+            mode=args.causal,
+            window=float(args.causal_window),
+        )
+
     from graph import build_hetero_graph
 
     data, stats = build_hetero_graph(events)
@@ -155,6 +182,23 @@ def main() -> None:
     print(f"Events: {stats.num_events}")
     print("Nodes:", {k.value: v for k, v in stats.num_nodes_by_type.items() if v})
     print("Edges:", {k.value: v for k, v in stats.num_edges_by_type.items() if v})
+
+    if args.export_tgn:
+        from graph import hetero_to_tgn_event_stream
+
+        stream = hetero_to_tgn_event_stream(data, cat_hash_buckets=8, include_meta=False)
+        out_path_tgn = out_dir / f"{stem}.tgn.pt"
+        torch.save(
+            {
+                "src": stream.src,
+                "dst": stream.dst,
+                "t": stream.t,
+                "msg": stream.msg,
+                "etype": stream.etype,
+            },
+            out_path_tgn,
+        )
+        print(f"Saved: {out_path_tgn}")
 
 
 if __name__ == "__main__":

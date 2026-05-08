@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, MutableMapping, Optional, Set, Tuple
+from typing import Dict, List, Mapping, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,8 @@ class IOCIndex:
 
     values: Set[str]
     types_by_value: Mapping[str, Set[str]]
+    # File-level line index: filename -> row_idx(0-based or 1-based) -> list[(type, value)]
+    hits_by_file_line: Mapping[str, Mapping[int, List[Tuple[str, str]]]]
 
 
 def load_ioc_ground_truth(path: str | Path) -> Mapping[str, IOCIndex]:
@@ -30,9 +32,14 @@ def load_ioc_ground_truth(path: str | Path) -> Mapping[str, IOCIndex]:
     for scenario_id, scenario in obj.items():
         values: Set[str] = set()
         types_by_value: Dict[str, Set[str]] = {}
+        hits_by_file_line: Dict[str, Dict[int, List[Tuple[str, str]]]] = {}
 
         files = (scenario or {}).get("files", {}) or {}
-        for _, f in files.items():
+        for fname, f in files.items():
+            fname_norm = str(fname)
+            if fname_norm not in hits_by_file_line:
+                hits_by_file_line[fname_norm] = {}
+
             for ioc in (f or {}).get("iocs", []) or []:
                 v = str(ioc.get("value", "")).strip()
                 t = str(ioc.get("type", "")).strip()
@@ -45,7 +52,19 @@ def load_ioc_ground_truth(path: str | Path) -> Mapping[str, IOCIndex]:
                 if t:
                     types_by_value[v_norm].add(t)
 
-        out[str(scenario_id)] = IOCIndex(values=values, types_by_value=types_by_value)
+                # line-level index
+                for ln in (ioc.get("lines") or []):
+                    try:
+                        ln_i = int(ln)
+                    except Exception:
+                        continue
+                    hits_by_file_line[fname_norm].setdefault(ln_i, []).append((t, v_norm))
+
+        out[str(scenario_id)] = IOCIndex(
+            values=values,
+            types_by_value=types_by_value,
+            hits_by_file_line=hits_by_file_line,
+        )
 
     return out
 

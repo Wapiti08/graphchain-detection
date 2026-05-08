@@ -44,6 +44,7 @@ class EdgeType(str, Enum):
     INVOKE = "INVOKE"  # PROC -> SYSCALL
     DEPEND = "DEPEND"  # PKG -> PKG
     LOAD = "LOAD"  # PKG -> PROC
+    CAUSE = "CAUSE"  # PROC -> PROC (causal/temporal dependency)
     REDIRECT = "REDIRECT"  # NET -> NET
     RESOLVE = "RESOLVE"  # NET -> NET
     RELAY = "RELAY"  # NET -> NET
@@ -163,6 +164,26 @@ EDGE_ATTRS: Mapping[EdgeType, Tuple[AttrSpec, ...]] = {
             description="Package entry point or loaded module.",
         ),
     ),
+    EdgeType.CAUSE: (
+        AttrSpec(
+            name="delta_t",
+            dtype="num",
+            default=0,
+            description="Time/step difference between cause and effect.",
+        ),
+        AttrSpec(
+            name="cause_rule",
+            dtype="cat",
+            default="",
+            description="Deterministic rule id that created this causal edge.",
+        ),
+        AttrSpec(
+            name="confidence",
+            dtype="num",
+            default=1.0,
+            description="Rule confidence (1.0 for hard rules).",
+        ),
+    ),
     EdgeType.REDIRECT: (
         AttrSpec(
             name="http_status",
@@ -215,6 +236,7 @@ EDGE_SCHEMA: Mapping[EdgeType, EdgeTriplet] = {
     EdgeType.INVOKE: (NodeType.PROC, EdgeType.INVOKE, NodeType.SYSCALL),
     EdgeType.DEPEND: (NodeType.PKG, EdgeType.DEPEND, NodeType.PKG),
     EdgeType.LOAD: (NodeType.PKG, EdgeType.LOAD, NodeType.PROC),
+    EdgeType.CAUSE: (NodeType.PROC, EdgeType.CAUSE, NodeType.PROC),
     EdgeType.REDIRECT: (NodeType.NET, EdgeType.REDIRECT, NodeType.NET),
     EdgeType.RESOLVE: (NodeType.NET, EdgeType.RESOLVE, NodeType.NET),
     EdgeType.RELAY: (NodeType.NET, EdgeType.RELAY, NodeType.NET),
