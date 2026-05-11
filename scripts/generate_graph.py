@@ -195,6 +195,8 @@ def main() -> None:
                 "t": stream.t,
                 "msg": stream.msg,
                 "etype": stream.etype,
+                "y_ioc": stream.y_ioc,
+                "y_ioc_line": stream.y_ioc_line,
             },
             out_path_tgn,
         )

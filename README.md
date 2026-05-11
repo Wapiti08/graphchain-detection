@@ -109,3 +109,21 @@ The canonical graph schema is based on HetHunt's heterogeneous runtime graph and
 - HTTP attrs: `method`, `uri`, `status_code`, `status_msg`, `user_agent`, `resp_bytes`
 - TLS attrs: `server_name`, `cipher`, `tls_version`, `sni_matches_cert`, `validation_status`
 - DNS attrs: `query_domain`, `query_type`, `answers`, `rcode`
+
+
+## Quick Running
+```
+python scripts/generate_graph.py --dataset synthchain --scenario sc1
+
+# (recommended) export flattened TGN event stream
+python scripts/generate_graph.py --dataset synthchain --scenario sc1 --export-tgn
+
+# train/validate on sc1 with strict time split (past -> future)
+python scripts/train_tgn_sc1.py --epochs 5 --batch-size 256
+
+# joint training across all scenarios (per-scenario time split)
+python scripts/train_tgn_synthchain.py --epochs 5 --batch-size 256 --auto-generate
+
+# strict cross-scenario generalization: hold out one scenario (example: test on sc3)
+python scripts/train_tgn_synthchain.py --holdout sc3 --epochs 5 --batch-size 256 --auto-generate
+```

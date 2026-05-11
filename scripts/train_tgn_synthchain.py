@@ -1,0 +1,601 @@
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import subprocess
+import sys
+from csv import DictWriter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    import torch
+
+
+@dataclass(frozen=True)
+class Stream:
+    src: "torch.Tensor"  # [E] int64
+    dst: "torch.Tensor"  # [E] int64
+    t: "torch.Tensor"  # [E] int64 (for TGNMemory last_update)
+    msg: "torch.Tensor"  # [E, D] float32
+    etype: "torch.Tensor"  # [E] int64
+    y_ioc: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
+    y_ioc_line: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Train/validate a TGN on SynthChain scenarios (time-split; optional holdout scenario)."
+    )
+    p.add_argument(
+        "--scenarios",
+        type=str,
+        default="sc1,sc2,sc3,sc4,sc5,sc6,sc7",
+        help="Comma-separated scenarios to use as the scenario universe.",
+    )
+    p.add_argument(
+        "--holdout",
+        type=str,
+        default="",
+        help="If set (e.g. sc3), train on all other scenarios and test on holdout.",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=512,
+    )
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+    )
+    p.add_argument(
+        "--train-frac",
+        type=float,
+        default=0.7,
+        help="Within each scenario, train on earliest fraction; validate on the rest.",
+    )
+    p.add_argument("--memory-dim", type=int, default=64)
+    p.add_argument("--time-dim", type=int, default=32)
+    p.add_argument("--etype-dim", type=int, default=16)
+    p.add_argument("--hard-neg", action="store_true")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--graphs-dir", type=str, default="artifacts/graphs")
+    p.add_argument("--out", type=str, default="artifacts/tgn_runs/synthchain_multi")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Force device. Use cpu if CUDA driver is old.",
+    )
+    p.add_argument(
+        "--auto-generate",
+        action="store_true",
+        help="If a scenario graph/stream is missing, try generating it via scripts/generate_graph.py.",
+    )
+    p.add_argument(
+        "--warmup",
+        action="store_true",
+        help="For evaluation, warm up memory on the scenario prefix (no-grad) before scoring the tail.",
+    )
+    p.add_argument(
+        "--eval-ioc",
+        action="store_true",
+        help="On evaluation tails, compute AUROC/AUPRC using msg[is_ioc] as label.",
+    )
+    p.add_argument(
+        "--save-scores",
+        action="store_true",
+        help="Save per-event scores for evaluation tails to a CSV under --out.",
+    )
+    return p.parse_args()
+
+
+def _parse_scenarios(s: str) -> List[str]:
+    out = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(tok)
+    return out
+
+
+def _time_split_idx(num_events: int, train_frac: float) -> int:
+    if num_events <= 1:
+        return 0
+    k = int(math.floor(float(train_frac) * float(num_events)))
+    return max(1, min(num_events - 1, k))
+
+
+def _load_stream_from_tgn_pt(path: Path) -> Stream:
+    import torch
+
+    blob = torch.load(path, weights_only=True)
+    return Stream(
+        src=blob["src"].long(),
+        dst=blob["dst"].long(),
+        t=blob["t"].long(),
+        msg=blob["msg"].float(),
+        etype=blob["etype"].long(),
+        y_ioc=(blob.get("y_ioc").long() if blob.get("y_ioc") is not None else None),
+        y_ioc_line=(blob.get("y_ioc_line").long() if blob.get("y_ioc_line") is not None else None),
+    )
+
+
+def _num_nodes_in_stream(st: Stream) -> int:
+    import torch
+
+    if st.src.numel() == 0:
+        return 0
+    return int(torch.max(torch.stack([st.src.max(), st.dst.max()])).item()) + 1
+
+
+def _offset_stream_nodes(st: Stream, base: int) -> Stream:
+    if base == 0:
+        return st
+    return Stream(
+        src=st.src + int(base),
+        dst=st.dst + int(base),
+        t=st.t,
+        msg=st.msg,
+        etype=st.etype,
+        y_ioc=st.y_ioc,
+        y_ioc_line=st.y_ioc_line,
+    )
+
+
+def _ensure_scenario_stream(
+    *,
+    repo_root: Path,
+    graphs_dir: Path,
+    scenario: str,
+    auto_generate: bool,
+) -> Tuple[Path, Stream]:
+    tgn_path = graphs_dir / f"synthchain_{scenario}.tgn.pt"
+    if tgn_path.exists():
+        return tgn_path, _load_stream_from_tgn_pt(tgn_path)
+
+    if not auto_generate:
+        raise SystemExit(
+            f"Missing `{tgn_path}`. Generate it via:\n"
+            f"  python scripts/generate_graph.py --dataset synthchain --scenario {scenario} --export-tgn\n"
+        )
+
+    # Try to generate via the current python executable.
+    env = os.environ.copy()
+    # Many servers have broken CUDA driver; this prevents torch from probing GPUs.
+    env.setdefault("CUDA_VISIBLE_DEVICES", "")
+    cmd = [
+        sys.executable,
+        str(repo_root / "scripts" / "generate_graph.py"),
+        "--dataset",
+        "synthchain",
+        "--scenario",
+        scenario,
+        "--export-tgn",
+        "--out",
+        str(graphs_dir.relative_to(repo_root)),
+    ]
+    subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
+
+    if not tgn_path.exists():
+        raise SystemExit(f"Auto-generation finished but `{tgn_path}` was not created.")
+    return tgn_path, _load_stream_from_tgn_pt(tgn_path)
+
+
+def _regenerate_scenario_stream(*, repo_root: Path, graphs_dir: Path, scenario: str) -> None:
+    env = os.environ.copy()
+    env.setdefault("CUDA_VISIBLE_DEVICES", "")
+    cmd = [
+        sys.executable,
+        str(repo_root / "scripts" / "generate_graph.py"),
+        "--dataset",
+        "synthchain",
+        "--scenario",
+        scenario,
+        "--export-tgn",
+        "--out",
+        str(graphs_dir.relative_to(repo_root)),
+    ]
+    subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
+
+
+def _build_neg_pools(
+    dst: "torch.Tensor",  # [E] int64
+    etype: "torch.Tensor",  # [E] int64
+    split_idx: int,
+) -> Dict[int, "torch.Tensor"]:
+    import torch
+
+    pools: Dict[int, "torch.Tensor"] = {}
+    for e in torch.unique(etype[:split_idx]).tolist():
+        e = int(e)
+        mask = (etype[:split_idx] == e)
+        pools[e] = torch.unique(dst[:split_idx][mask])
+    return pools
+
+
+def _roc_auc(y_true: List[int], y_score: List[float]) -> float:
+    # Returns AUROC in [0,1]. If undefined (only one class), returns NaN.
+    if not y_true:
+        return float("nan")
+    n_pos = sum(1 for y in y_true if y == 1)
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    order = sorted(range(len(y_true)), key=lambda i: y_score[i], reverse=True)
+    tp = 0
+    fp = 0
+    prev_fpr = 0.0
+    prev_tpr = 0.0
+    auc = 0.0
+    for i in order:
+        if y_true[i] == 1:
+            tp += 1
+        else:
+            fp += 1
+        tpr = tp / n_pos
+        fpr = fp / n_neg
+        # trapezoid area
+        auc += (fpr - prev_fpr) * (tpr + prev_tpr) / 2.0
+        prev_fpr, prev_tpr = fpr, tpr
+    return float(auc)
+
+
+def _pr_auc(y_true: List[int], y_score: List[float]) -> float:
+    # Returns area under precision-recall curve. If undefined, returns NaN.
+    if not y_true:
+        return float("nan")
+    n_pos = sum(1 for y in y_true if y == 1)
+    if n_pos == 0:
+        return float("nan")
+
+    order = sorted(range(len(y_true)), key=lambda i: y_score[i], reverse=True)
+    tp = 0
+    fp = 0
+    prev_recall = 0.0
+    ap = 0.0
+    for i in order:
+        if y_true[i] == 1:
+            tp += 1
+        else:
+            fp += 1
+        precision = tp / max(1, (tp + fp))
+        recall = tp / n_pos
+        ap += (recall - prev_recall) * precision
+        prev_recall = recall
+    return float(ap)
+
+
+def main() -> None:
+    args = _parse_args()
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    # If user forces CPU, prevent torch from probing CUDA.
+    if args.device == "cpu":
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch_geometric.nn.models.tgn import IdentityMessage, LastAggregator, TGNMemory
+
+    torch.manual_seed(int(args.seed))
+
+    device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
+
+    graphs_dir = (repo_root / args.graphs_dir).resolve()
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    scenario_universe = _parse_scenarios(args.scenarios)
+    if not scenario_universe:
+        raise SystemExit("--scenarios is empty")
+
+    if args.holdout:
+        holdout = args.holdout.strip()
+        train_scenarios = [s for s in scenario_universe if s != holdout]
+        test_scenarios = [holdout]
+    else:
+        # Joint training/validation within each scenario (time-split).
+        train_scenarios = list(scenario_universe)
+        test_scenarios = list(scenario_universe)
+
+    streams: Dict[str, Stream] = {}
+    for sc in sorted(set(train_scenarios + test_scenarios)):
+        _, st = _ensure_scenario_stream(
+            repo_root=repo_root,
+            graphs_dir=graphs_dir,
+            scenario=sc,
+            auto_generate=bool(args.auto_generate),
+        )
+        streams[sc] = st
+
+    # Ensure all scenarios have identical msg dimensions.
+    msg_dims = {sc: int(streams[sc].msg.size(-1)) for sc in streams}
+    uniq_dims = sorted(set(msg_dims.values()))
+    if len(uniq_dims) > 1:
+        if not bool(args.auto_generate):
+            raise SystemExit(
+                "Inconsistent msg dimensions across scenarios (likely stale *.tgn.pt files). "
+                f"Found dims: {msg_dims}. Re-export with --export-tgn for all scenarios, "
+                "or rerun with --auto-generate."
+            )
+        # Regenerate scenarios to match the *current* feature projection.
+        # After feature changes, newly exported streams often have a smaller dim;
+        # prefer the minimum dim as the target (assumes newer projection removes/merges fields).
+        target_dim = min(uniq_dims)
+        for sc, d in msg_dims.items():
+            if d != target_dim:
+                _regenerate_scenario_stream(repo_root=repo_root, graphs_dir=graphs_dir, scenario=sc)
+                streams[sc] = _load_stream_from_tgn_pt(graphs_dir / f"synthchain_{sc}.tgn.pt")
+
+        msg_dims2 = {sc: int(streams[sc].msg.size(-1)) for sc in streams}
+        if len(set(msg_dims2.values())) > 1:
+            raise SystemExit(f"Still inconsistent msg dimensions after regeneration: {msg_dims2}")
+
+    # IMPORTANT: each scenario stream uses its own 0..N-1 node id space.
+    # Offset per scenario to make node ids disjoint across scenarios.
+    scenario_base: Dict[str, int] = {}
+    base = 0
+    for sc in sorted(streams.keys()):
+        scenario_base[sc] = base
+        base += _num_nodes_in_stream(streams[sc])
+    for sc in list(streams.keys()):
+        streams[sc] = _offset_stream_nodes(streams[sc], scenario_base[sc])
+
+    # Determine global sizes across all included (offset) streams.
+    all_src = torch.cat([streams[sc].src for sc in streams], dim=0)
+    all_dst = torch.cat([streams[sc].dst for sc in streams], dim=0)
+    all_etype = torch.cat([streams[sc].etype for sc in streams], dim=0)
+    num_nodes = int(torch.max(torch.stack([all_src.max(), all_dst.max()])).item()) + 1 if all_src.numel() else 0
+    num_etypes = int(all_etype.max().item()) + 1 if all_etype.numel() else 1
+    raw_msg_dim = int(next(iter(streams.values())).msg.size(-1)) + int(args.etype_dim)
+
+    etype_emb = nn.Embedding(num_etypes, int(args.etype_dim)).to(device)
+    memory = TGNMemory(
+        num_nodes=num_nodes,
+        raw_msg_dim=raw_msg_dim,
+        memory_dim=int(args.memory_dim),
+        time_dim=int(args.time_dim),
+        message_module=IdentityMessage(raw_msg_dim=raw_msg_dim, memory_dim=int(args.memory_dim), time_dim=int(args.time_dim)),
+        aggregator_module=LastAggregator(),
+    ).to(device)
+    link_pred = nn.Sequential(
+        nn.Linear(2 * int(args.memory_dim) + raw_msg_dim, int(args.memory_dim)),
+        nn.ReLU(),
+        nn.Linear(int(args.memory_dim), 1),
+    ).to(device)
+
+    opt = torch.optim.Adam(list(memory.parameters()) + list(link_pred.parameters()) + list(etype_emb.parameters()), lr=float(args.lr))
+    assoc = torch.empty(num_nodes, dtype=torch.long, device=device).fill_(-1)
+
+    def sample_neg(true_dst: "torch.Tensor", e: "torch.Tensor", pools: Dict[int, "torch.Tensor"]) -> "torch.Tensor":
+        if args.hard_neg and int(e.item()) in pools and pools[int(e.item())].numel() > 1:
+            pool = pools[int(e.item())].to(true_dst.device)
+            j = torch.randint(0, int(pool.numel()), (1,), device=true_dst.device)
+            neg = pool[j].view_as(true_dst)
+            if int(neg.item()) == int(true_dst.item()):
+                neg = pool[(j + 1) % int(pool.numel())].view_as(true_dst)
+            return neg
+        neg = torch.randint(0, num_nodes, true_dst.size(), device=true_dst.device)
+        if true_dst.numel() == 1 and int(neg.item()) == int(true_dst.item()):
+            neg = (neg + 1) % num_nodes
+        return neg
+
+    def run_one_scenario(
+        sc: str,
+        *,
+        train: bool,
+        prefix_only: bool,
+        collect_eval: bool = False,
+    ) -> Tuple[float, float, Optional[List[Dict[str, object]]], Optional[Tuple[float, float]]]:
+        st = streams[sc]
+        src = st.src.to(device)
+        dst = st.dst.to(device)
+        t = st.t.to(device)
+        msg = st.msg.to(device)
+        etype = st.etype.to(device)
+        y_ioc = getattr(st, "y_ioc", None)
+        if y_ioc is not None:
+            y_ioc = y_ioc.to(device)
+
+        split_idx = _time_split_idx(int(src.numel()), float(args.train_frac))
+        lo, hi = (0, split_idx) if prefix_only else (split_idx, int(src.numel()))
+
+        pools = _build_neg_pools(dst, etype, split_idx) if args.hard_neg else {}
+
+        total_loss = 0.0
+        correct = 0.0
+        count = 0.0
+        rows: Optional[List[Dict[str, object]]] = [] if collect_eval else None
+        y_true: List[int] = []
+        y_score: List[float] = []
+
+        if train:
+            memory.train()
+            link_pred.train()
+            etype_emb.train()
+        else:
+            memory.eval()
+            link_pred.eval()
+            etype_emb.eval()
+
+        # Prevent leakage across scenarios.
+        memory.reset_state()
+
+        # Evaluation warmup: use prefix to update memory (no loss computed).
+        if (not train) and (not prefix_only) and bool(args.warmup) and split_idx > 0:
+            with torch.no_grad():
+                w_lo, w_hi = 0, split_idx
+                for i in range(w_lo, w_hi, int(args.batch_size)):
+                    memory.detach()
+                    j = min(w_hi, i + int(args.batch_size))
+                    s = src[i:j]
+                    d = dst[i:j]
+                    tt = t[i:j]
+                    m = msg[i:j]
+                    e = etype[i:j]
+                    eemb = etype_emb(e)
+                    raw_msg = torch.cat([m, eemb], dim=-1)
+                    memory.update_state(s, d, tt, raw_msg.detach())
+
+        for i in range(lo, hi, int(args.batch_size)):
+            memory.detach()
+
+            j = min(hi, i + int(args.batch_size))
+            s = src[i:j]
+            d = dst[i:j]
+            tt = t[i:j]
+            m = msg[i:j]
+            e = etype[i:j]
+
+            neg_d = torch.stack([sample_neg(d[k : k + 1], e[k : k + 1], pools).view(()) for k in range(int(d.numel()))])
+            eemb = etype_emb(e)
+            raw_msg = torch.cat([m, eemb], dim=-1)
+
+            n_id = torch.unique(torch.cat([s, d, neg_d], dim=0))
+            assoc[n_id] = torch.arange(n_id.size(0), device=device)
+            z, _ = memory(n_id)
+
+            z_s = z[assoc[s]]
+            z_d = z[assoc[d]]
+            z_neg = z[assoc[neg_d]]
+
+            pos_inp = torch.cat([z_s, z_d, raw_msg], dim=-1)
+            neg_inp = torch.cat([z_s, z_neg, raw_msg], dim=-1)
+
+            pos_logit = link_pred(pos_inp).view(-1)
+            neg_logit = link_pred(neg_inp).view(-1)
+
+            y = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)], dim=0)
+            logit = torch.cat([pos_logit, neg_logit], dim=0)
+            loss = F.binary_cross_entropy_with_logits(logit, y)
+
+            if train:
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+            with torch.no_grad():
+                prob = torch.sigmoid(logit)
+                pred = (prob > 0.5).float()
+                correct += float((pred == y).sum().item())
+                count += float(y.numel())
+                total_loss += float(loss.item()) * float(y.numel())
+
+                if collect_eval:
+                    # score only the positive (real) edges
+                    pos_prob = torch.sigmoid(pos_logit)
+                    pos_score = (-torch.log(pos_prob.clamp_min(1e-12))).detach().cpu()
+                    # label: prefer exported y_ioc; fallback to 0 if unavailable.
+                    if y_ioc is not None:
+                        lbl = y_ioc[i:j].to(torch.int64).detach().cpu()
+                    else:
+                        lbl = torch.zeros((int(pos_score.numel()),), dtype=torch.int64)
+                    for k in range(int(pos_score.numel())):
+                        y_true.append(int(lbl[k].item()))
+                        y_score.append(float(pos_score[k].item()))
+                        assert rows is not None
+                        rows.append(
+                            {
+                                "scenario": sc,
+                                "t": int(tt[k].item()),
+                                "etype": int(e[k].item()),
+                                "src": int(s[k].item()),
+                                "dst": int(d[k].item()),
+                                "score": float(pos_score[k].item()),
+                                "is_ioc": int(lbl[k].item()),
+                            }
+                        )
+
+            memory.update_state(s, d, tt, raw_msg.detach())
+
+        metrics = None
+        if collect_eval and bool(args.eval_ioc):
+            metrics = (_roc_auc(y_true, y_score), _pr_auc(y_true, y_score))
+
+        return (total_loss / max(1.0, count)), (correct / max(1.0, count)), rows, metrics
+
+    out_dir = (repo_root / args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for ep in range(1, int(args.epochs) + 1):
+        train_losses = []
+        train_accs = []
+        for sc in train_scenarios:
+            tl, ta, _, _ = run_one_scenario(sc, train=True, prefix_only=True, collect_eval=False)
+            train_losses.append(tl)
+            train_accs.append(ta)
+        tr_loss = float(sum(train_losses) / max(1, len(train_losses)))
+        tr_acc = float(sum(train_accs) / max(1, len(train_accs)))
+
+        with torch.no_grad():
+            val_losses = []
+            val_accs = []
+            eval_rows: List[Dict[str, object]] = []
+            eval_aurocs: List[float] = []
+            eval_auprcs: List[float] = []
+            for sc in test_scenarios:
+                # In holdout mode, evaluate on the full scenario tail (future portion).
+                vl, va, rows, metrics = run_one_scenario(
+                    sc, train=False, prefix_only=False, collect_eval=bool(args.save_scores or args.eval_ioc)
+                )
+                val_losses.append(vl)
+                val_accs.append(va)
+                if rows is not None:
+                    eval_rows.extend(rows)
+                if metrics is not None:
+                    auroc, auprc = metrics
+                    if not math.isnan(auroc):
+                        eval_aurocs.append(float(auroc))
+                    if not math.isnan(auprc):
+                        eval_auprcs.append(float(auprc))
+            va_loss = float(sum(val_losses) / max(1, len(val_losses)))
+            va_acc = float(sum(val_accs) / max(1, len(val_accs)))
+
+        extra = ""
+        if bool(args.eval_ioc) and (eval_aurocs or eval_auprcs):
+            extra = f" | AUROC {sum(eval_aurocs)/max(1,len(eval_aurocs)):.3f} AUPRC {sum(eval_auprcs)/max(1,len(eval_auprcs)):.3f}"
+        print(
+            f"epoch {ep:03d} | train({len(train_scenarios)}) loss {tr_loss:.4f} acc {tr_acc:.3f} "
+            f"| val({len(test_scenarios)}) loss {va_loss:.4f} acc {va_acc:.3f}{extra}"
+        )
+
+        if bool(args.save_scores):
+            csv_path = out_dir / "eval_tail_scores.csv"
+            with csv_path.open("w", newline="") as f:
+                w = DictWriter(f, fieldnames=["scenario", "t", "etype", "src", "dst", "score", "is_ioc"])
+                w.writeheader()
+                for r in eval_rows:
+                    w.writerow(r)
+
+    torch.save(
+        {
+            "memory": memory.state_dict(),
+            "link_pred": link_pred.state_dict(),
+            "etype_emb": etype_emb.state_dict(),
+            "config": vars(args),
+            "train_scenarios": train_scenarios,
+            "test_scenarios": test_scenarios,
+            "scenario_base": scenario_base,
+        },
+        out_dir / ("ckpt_holdout.pt" if args.holdout else "ckpt_joint.pt"),
+    )
+    print(f"Saved: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
