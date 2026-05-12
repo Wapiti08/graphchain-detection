@@ -126,4 +126,18 @@ python scripts/train_tgn_synthchain.py --epochs 5 --batch-size 256 --auto-genera
 
 # strict cross-scenario generalization: hold out one scenario (example: test on sc3)
 python scripts/train_tgn_synthchain.py --holdout sc3 --epochs 5 --batch-size 256 --auto-generate
+
+# LOSO (all folds sc1..sc7); writes artifacts/tgn_runs/loso_holdout_*/run_summary.json and loso_summary.csv
+# Optional: EPOCHS=10 SEED=1 bash scripts/run_loso_synthchain.sh
+bash scripts/run_loso_synthchain.sh
+
+# Optional: shallow IOC supervision (margin on anomaly score vs non-IOC in same batch)
+# python scripts/train_tgn_synthchain.py --holdout sc3 --eval-ioc --warmup --lambda-ioc-rank 0.1 --ioc-rank-margin 0.5 ...
+
+# aggregate_alerts shares graph/alert_eval.py with train metrics (pf / ar / fr / p@K in epoch logs)
+python scripts/aggregate_alerts.py --scores-csv artifacts/tgn_runs/synthchain_multi/best_eval_tail_scores.csv --out-dir artifacts/alerts
+
+# full pipeline smoke: pytest + sc1 graph/TGN + 1-epoch train + tail scores + aggregate
+# needs data/SynthChain; if QUT CSV is absent, only SynthChain-related tests run
+bash scripts/e2e_regress.sh
 ```

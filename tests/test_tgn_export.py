@@ -10,8 +10,14 @@ class TestTGNExport(unittest.TestCase):
     def test_export_tgn_stream_shapes(self) -> None:
         import torch
 
+        primary = self.repo_root / "artifacts/graphs/synthchain_sc1.full.pt"
+        fallback = self.repo_root / "artifacts/graphs/synthchain_sc1_refactor_azure.full.pt"
+        graph_path = primary if primary.is_file() else fallback
+        if not graph_path.is_file():
+            self.skipTest(f"Missing graph artifact: {primary} or {fallback}")
+
         obj = torch.load(
-            self.repo_root / "artifacts/graphs/synthchain_sc1_refactor_azure.full.pt",
+            graph_path,
             map_location="cpu",
             weights_only=False,
         )

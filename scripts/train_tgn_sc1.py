@@ -59,8 +59,19 @@ def _ensure_stream(tgn_path: Path, full_path: Path) -> Dict[str, "torch.Tensor"]
 
     stream = hetero_to_tgn_event_stream(data, cat_hash_buckets=8, include_meta=False)
     tgn_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"src": stream.src, "dst": stream.dst, "t": stream.t, "msg": stream.msg, "etype": stream.etype}, tgn_path)
-    return {"src": stream.src, "dst": stream.dst, "t": stream.t, "msg": stream.msg, "etype": stream.etype}
+    payload = {
+        "src": stream.src,
+        "dst": stream.dst,
+        "t": stream.t,
+        "msg": stream.msg,
+        "etype": stream.etype,
+    }
+    if stream.y_ioc is not None:
+        payload["y_ioc"] = stream.y_ioc
+    if stream.y_ioc_line is not None:
+        payload["y_ioc_line"] = stream.y_ioc_line
+    torch.save(payload, tgn_path)
+    return {k: v for k, v in payload.items()}
 
 
 def _build_neg_pools(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -95,6 +96,62 @@ def _parse_args() -> argparse.Namespace:
         "--save-scores",
         action="store_true",
         help="Save per-event scores for evaluation tails to a CSV under --out.",
+    )
+    p.add_argument(
+        "--save-scores-each-epoch",
+        action="store_true",
+        help="Save per-event tail scores for every epoch (eval_tail_scores_epochXXX.csv).",
+    )
+    p.add_argument(
+        "--select-metric",
+        type=str,
+        default="auprc",
+        choices=["auprc", "auroc"],
+        help="Metric to select and save the best checkpoint (requires --eval-ioc).",
+    )
+    p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop if --select-metric does not improve for this many epochs (0 = disabled). Requires --eval-ioc.",
+    )
+    p.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum improvement on --select-metric to reset early-stopping patience.",
+    )
+    p.add_argument(
+        "--topk",
+        type=str,
+        default="10,50,100,500",
+        help="Comma-separated K values for top-K IOC hit reporting on eval tail scores.",
+    )
+    p.add_argument(
+        "--eval-alert-window",
+        type=int,
+        default=3600,
+        help="Same as aggregate_alerts --window when reporting alert-rate / precision-in-flagged.",
+    )
+    p.add_argument("--eval-alert-quantile", type=float, default=0.99)
+    p.add_argument("--eval-alert-min-events", type=int, default=3)
+    p.add_argument("--eval-alert-topk-events", type=int, default=0, help="0 = use quantile.")
+    p.add_argument(
+        "--no-eval-alert-dedupe",
+        action="store_true",
+        help="Disable dedupe for alert metrics (matches aggregate_alerts --no-dedupe).",
+    )
+    p.add_argument(
+        "--lambda-ioc-rank",
+        type=float,
+        default=0.0,
+        help="If >0, add margin ranking loss so IOC edges get higher anomaly score than non-IOC in same batch (train prefix only).",
+    )
+    p.add_argument(
+        "--ioc-rank-margin",
+        type=float,
+        default=0.5,
+        help="Margin for IOC ranking loss (anomaly score = -log sigmoid(pos_logit)).",
     )
     return p.parse_args()
 
@@ -277,6 +334,30 @@ def _pr_auc(y_true: List[int], y_score: List[float]) -> float:
     return float(ap)
 
 
+def _parse_topk(s: str) -> List[int]:
+    out: List[int] = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            k = int(tok)
+        except Exception:
+            continue
+        if k > 0:
+            out.append(k)
+    return sorted(set(out))
+
+
+def _topk_ioc_hits(eval_rows: List[Dict[str, object]], ks: Sequence[int]) -> Dict[int, int]:
+    rows = sorted(eval_rows, key=lambda r: float(r["score"]), reverse=True)
+    out: Dict[int, int] = {}
+    for k in ks:
+        kk = min(k, len(rows))
+        out[k] = int(sum(int(rows[i]["is_ioc"]) for i in range(kk)))
+    return out
+
+
 def main() -> None:
     args = _parse_args()
     repo_root = Path(__file__).resolve().parents[1]
@@ -290,6 +371,7 @@ def main() -> None:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    from graph.alert_eval import tail_alert_metrics
     from torch_geometric.nn.models.tgn import IdentityMessage, LastAggregator, TGNMemory
 
     torch.manual_seed(int(args.seed))
@@ -302,6 +384,9 @@ def main() -> None:
     scenario_universe = _parse_scenarios(args.scenarios)
     if not scenario_universe:
         raise SystemExit("--scenarios is empty")
+
+    if int(args.early_stop_patience) > 0 and not bool(args.eval_ioc):
+        print("warning: --early-stop-patience is ignored without --eval-ioc.", flush=True)
 
     if args.holdout:
         holdout = args.holdout.strip()
@@ -483,6 +568,21 @@ def main() -> None:
             logit = torch.cat([pos_logit, neg_logit], dim=0)
             loss = F.binary_cross_entropy_with_logits(logit, y)
 
+            if train and float(args.lambda_ioc_rank) > 0.0 and y_ioc is not None:
+                yb = y_ioc[i:j].float()
+                pos_prob = torch.sigmoid(pos_logit).view(-1)
+                score_anom = -torch.log(pos_prob.clamp_min(1e-12))
+                mask_i = yb > 0.5
+                mask_n = yb < 0.5
+                if int(mask_i.sum().item()) > 0 and int(mask_n.sum().item()) > 0:
+                    si = score_anom[mask_i]
+                    sn = score_anom[mask_n]
+                    idx = torch.randint(0, int(sn.numel()), (int(si.numel()),), device=device)
+                    pair_sn = sn[idx]
+                    margin = float(args.ioc_rank_margin)
+                    loss_ioc = F.relu(margin - (si - pair_sn)).mean()
+                    loss = loss + float(args.lambda_ioc_rank) * loss_ioc
+
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -530,8 +630,26 @@ def main() -> None:
 
     out_dir = (repo_root / args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    topks = _parse_topk(args.topk)
+
+    best_metric = float("-inf")
+    best_epoch: Optional[int] = None
+    best_auroc_at_best: float = float("nan")
+    best_auprc_at_best: float = float("nan")
+    best_ckpt_path = out_dir / ("best_ckpt_holdout.pt" if args.holdout else "best_ckpt_joint.pt")
+    best_scores_path = out_dir / "best_eval_tail_scores.csv"
+
+    last_tr_loss = last_tr_acc = last_va_loss = last_va_acc = float("nan")
+    last_auroc = last_auprc = float("nan")
+    last_tail_eval: Dict[str, float] = {}
+    best_tail_eval: Dict[str, float] = {}
+
+    es_best = float("-inf")
+    es_patience = 0
+    last_completed_epoch = 0
 
     for ep in range(1, int(args.epochs) + 1):
+        last_completed_epoch = int(ep)
         train_losses = []
         train_accs = []
         for sc in train_scenarios:
@@ -566,20 +684,102 @@ def main() -> None:
             va_acc = float(sum(val_accs) / max(1, len(val_accs)))
 
         extra = ""
+        cur_auroc = float("nan")
+        cur_auprc = float("nan")
         if bool(args.eval_ioc) and (eval_aurocs or eval_auprcs):
-            extra = f" | AUROC {sum(eval_aurocs)/max(1,len(eval_aurocs)):.3f} AUPRC {sum(eval_auprcs)/max(1,len(eval_auprcs)):.3f}"
+            cur_auroc = float(sum(eval_aurocs) / max(1, len(eval_aurocs))) if eval_aurocs else float("nan")
+            cur_auprc = float(sum(eval_auprcs) / max(1, len(eval_auprcs))) if eval_auprcs else float("nan")
+            extra = f" | AUROC {cur_auroc:.3f} AUPRC {cur_auprc:.3f}"
+
+        if topks and eval_rows:
+            hits = _topk_ioc_hits(eval_rows, topks)
+            extra += " | " + " ".join([f"top{k}={hits[k]}" for k in topks])
+
+        epoch_tail_eval: Dict[str, float] = {}
+        if bool(args.eval_ioc) and eval_rows:
+            epoch_tail_eval = tail_alert_metrics(
+                eval_rows,
+                topks=topks,
+                alert_window=int(args.eval_alert_window),
+                alert_quantile=float(args.eval_alert_quantile),
+                alert_min_events=int(args.eval_alert_min_events),
+                alert_topk_events=int(args.eval_alert_topk_events),
+                dedupe=not bool(args.no_eval_alert_dedupe),
+            )
+            last_tail_eval = dict(epoch_tail_eval)
+            extra += (
+                f" | pf={epoch_tail_eval['precision_in_flagged']:.3f}"
+                f" ar={epoch_tail_eval['alerts_per_tail_event']:.4f}"
+                f" fr={epoch_tail_eval['flagged_rate']:.3f}"
+            )
+            for k in topks:
+                pk = epoch_tail_eval.get(f"p_at_{int(k)}", float("nan"))
+                extra += f" p@{int(k)}={pk:.3f}"
         print(
             f"epoch {ep:03d} | train({len(train_scenarios)}) loss {tr_loss:.4f} acc {tr_acc:.3f} "
             f"| val({len(test_scenarios)}) loss {va_loss:.4f} acc {va_acc:.3f}{extra}"
         )
 
-        if bool(args.save_scores):
-            csv_path = out_dir / "eval_tail_scores.csv"
+        last_tr_loss, last_tr_acc = float(tr_loss), float(tr_acc)
+        last_va_loss, last_va_acc = float(va_loss), float(va_acc)
+        last_auroc, last_auprc = float(cur_auroc), float(cur_auprc)
+
+        if bool(args.save_scores) or bool(args.save_scores_each_epoch):
+            csv_path = out_dir / ("eval_tail_scores.csv" if bool(args.save_scores) else f"eval_tail_scores_epoch{ep:03d}.csv")
             with csv_path.open("w", newline="") as f:
                 w = DictWriter(f, fieldnames=["scenario", "t", "etype", "src", "dst", "score", "is_ioc"])
                 w.writeheader()
                 for r in eval_rows:
                     w.writerow(r)
+
+        # Best checkpoint selection (requires eval-ioc)
+        if bool(args.eval_ioc):
+            cur = cur_auprc if args.select_metric == "auprc" else cur_auroc
+            if not math.isnan(cur) and cur > best_metric:
+                best_metric = float(cur)
+                best_epoch = int(ep)
+                best_auroc_at_best = float(cur_auroc)
+                best_auprc_at_best = float(cur_auprc)
+                torch.save(
+                    {
+                        "memory": memory.state_dict(),
+                        "link_pred": link_pred.state_dict(),
+                        "etype_emb": etype_emb.state_dict(),
+                        "config": vars(args),
+                        "train_scenarios": train_scenarios,
+                        "test_scenarios": test_scenarios,
+                        "scenario_base": scenario_base,
+                        "best_epoch": best_epoch,
+                        "best_metric": best_metric,
+                        "metric_name": args.select_metric,
+                    },
+                    best_ckpt_path,
+                )
+                if eval_rows:
+                    with best_scores_path.open("w", newline="") as f:
+                        w = DictWriter(f, fieldnames=["scenario", "t", "etype", "src", "dst", "score", "is_ioc"])
+                        w.writeheader()
+                        for r in eval_rows:
+                            w.writerow(r)
+                if epoch_tail_eval:
+                    best_tail_eval = dict(epoch_tail_eval)
+
+            # Early stopping on validation tail metric (same as --select-metric)
+            if int(args.early_stop_patience) > 0:
+                cur_es = cur_auprc if args.select_metric == "auprc" else cur_auroc
+                if not math.isnan(cur_es):
+                    if cur_es > es_best + float(args.early_stop_min_delta):
+                        es_best = float(cur_es)
+                        es_patience = 0
+                    else:
+                        es_patience += 1
+                        if es_patience >= int(args.early_stop_patience):
+                            print(
+                                f"early_stop: {args.select_metric} did not improve by "
+                                f">{args.early_stop_min_delta} for {args.early_stop_patience} epochs "
+                                f"(best_seen={es_best:.4f}). Stopping at epoch {ep:03d}."
+                            )
+                            break
 
     torch.save(
         {
@@ -593,6 +793,47 @@ def main() -> None:
         },
         out_dir / ("ckpt_holdout.pt" if args.holdout else "ckpt_joint.pt"),
     )
+    if best_epoch is not None:
+        print(f"Best by {args.select_metric}: epoch {best_epoch} = {best_metric:.4f}")
+    if int(args.early_stop_patience) > 0 and last_completed_epoch < int(args.epochs):
+        print(f"Completed {last_completed_epoch}/{int(args.epochs)} epochs (early stopping).")
+
+    def _jf(x: object) -> object:
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return None
+        return x
+
+    best_metric_out: Optional[float] = None
+    if best_epoch is not None and not math.isinf(float(best_metric)):
+        best_metric_out = float(best_metric)
+
+    summary = {
+        "holdout": str(args.holdout) if args.holdout else "",
+        "scenarios": list(scenario_universe),
+        "train_scenarios": train_scenarios,
+        "test_scenarios": test_scenarios,
+        "epochs": int(args.epochs),
+        "epochs_completed": int(last_completed_epoch),
+        "early_stopped": bool(last_completed_epoch < int(args.epochs)),
+        "early_stop_patience": int(args.early_stop_patience),
+        "early_stop_min_delta": float(args.early_stop_min_delta),
+        "seed": int(args.seed),
+        "select_metric": str(args.select_metric),
+        "best_epoch": best_epoch,
+        "best_metric": best_metric_out,
+        "best_auroc": _jf(best_auroc_at_best),
+        "best_auprc": _jf(best_auprc_at_best),
+        "last_train_loss": _jf(last_tr_loss),
+        "last_train_acc": _jf(last_tr_acc),
+        "last_val_loss": _jf(last_va_loss),
+        "last_val_acc": _jf(last_va_acc),
+        "last_auroc": _jf(last_auroc),
+        "last_auprc": _jf(last_auprc),
+        "last_tail_eval": {k: _jf(v) for k, v in last_tail_eval.items()},
+        "best_tail_eval": {k: _jf(v) for k, v in best_tail_eval.items()},
+    }
+    (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
     print(f"Saved: {out_dir}")
 
 

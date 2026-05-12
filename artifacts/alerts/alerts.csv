@@ -1,0 +1,2 @@
+alert_id,scenario,t_start,t_end,num_events,num_nodes,max_score,ioc_hits
+0,sc3,1765728640,1765729664,5,6,3.7188844680786133,5
