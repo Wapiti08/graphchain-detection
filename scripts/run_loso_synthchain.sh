@@ -4,7 +4,12 @@
 #
 # Usage (from repo root):
 #   bash scripts/run_loso_synthchain.sh
-#   EPOCHS=10 SEED=0 bash scripts/run_loso_synthchain.sh
+#   # Recommended (paper-style LOSO + early stopping on val AUPRC):
+#   EPOCHS=20 SEED=42 DEVICE=cuda \
+#     EXTRA_TRAIN_ARGS='--early-stop-patience 5 --early-stop-min-delta 0.001' \
+#     bash scripts/run_loso_synthchain.sh
+#   # Smoke / CI:
+#   EPOCHS=2 DEVICE=cpu bash scripts/run_loso_synthchain.sh
 #
 set -euo pipefail
 
@@ -12,9 +17,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 PY="${PYTHON:-python3}"
 
-EPOCHS="${EPOCHS:-5}"
+EPOCHS="${EPOCHS:-20}"
 SEED="${SEED:-42}"
 BATCH="${BATCH_SIZE:-256}"
+DEVICE="${DEVICE:-cpu}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 
 if ! "${PY}" -c "import torch, torch_geometric" 2>/dev/null; then
@@ -36,7 +42,7 @@ for H in sc1 sc2 sc3 sc4 sc5 sc6 sc7; do
     --epochs "${EPOCHS}" \
     --batch-size "${BATCH}" \
     --seed "${SEED}" \
-    --device cpu \
+    --device "${DEVICE}" \
     --auto-generate \
     --warmup \
     --eval-ioc \
