@@ -188,18 +188,22 @@ def main() -> None:
 
         stream = hetero_to_tgn_event_stream(data, cat_hash_buckets=8, include_meta=False)
         out_path_tgn = out_dir / f"{stem}.tgn.pt"
-        torch.save(
-            {
-                "src": stream.src,
-                "dst": stream.dst,
-                "t": stream.t,
-                "msg": stream.msg,
-                "etype": stream.etype,
-                "y_ioc": stream.y_ioc,
-                "y_ioc_line": stream.y_ioc_line,
-            },
-            out_path_tgn,
-        )
+        payload = {
+            "src": stream.src,
+            "dst": stream.dst,
+            "t": stream.t,
+            "msg": stream.msg,
+            "etype": stream.etype,
+            "y_ioc": stream.y_ioc,
+            "y_ioc_line": stream.y_ioc_line,
+        }
+        if stream.row_idx is not None:
+            payload["row_idx"] = stream.row_idx
+        if stream.source_file is not None:
+            payload["source_file"] = list(stream.source_file)
+        if stream.ioc_type is not None:
+            payload["ioc_type"] = list(stream.ioc_type)
+        torch.save(payload, out_path_tgn)
         print(f"Saved: {out_path_tgn}")
 
 

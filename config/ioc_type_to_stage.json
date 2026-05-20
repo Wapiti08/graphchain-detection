@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "description": "Heuristic mapping from SynthChain IOC ground-truth 'type' to coarse attack stages. Used to derive observable-stage ground truth from ioc_ground_truth.json (line-level evidence).",
+  "stages": [
+    "resource_development",
+    "initial_access_delivery",
+    "execution",
+    "persistence_privilege_defense_evasion",
+    "discovery_collection",
+    "command_and_control",
+    "exfiltration_impact"
+  ],
+  "ioc_type_to_stage": {
+    "package_name": "resource_development",
+    "cloud_recon": "resource_development",
+    "monitoring": "resource_development",
+
+    "malicious_binary": "initial_access_delivery",
+    "file_artifact": "initial_access_delivery",
+    "file_transfer": "initial_access_delivery",
+
+    "execution": "execution",
+    "execution_chain": "execution",
+    "process_injection": "execution",
+
+    "persistence": "persistence_privilege_defense_evasion",
+    "defense_evasion": "persistence_privilege_defense_evasion",
+    "crypto_indicator": "persistence_privilege_defense_evasion",
+
+    "attack_ip": "command_and_control",
+    "c2_agent": "command_and_control",
+    "dns_indicator": "command_and_control",
+    "suspicious_port": "command_and_control",
+
+    "data_exfiltration": "exfiltration_impact"
+  }
+}

@@ -140,4 +140,14 @@ python scripts/aggregate_alerts.py --scores-csv artifacts/tgn_runs/synthchain_mu
 # full pipeline smoke: pytest + sc1 graph/TGN + 1-epoch train + tail scores + aggregate
 # needs data/SynthChain; if QUT CSV is absent, only SynthChain-related tests run
 bash scripts/e2e_regress.sh
+
+# generate ground truth stage mapping data
+python3 scripts/build_synthchain_stage_gt.py --out-dir artifacts/stage_gt
+
+# partial attack-chain reconstruction (needs tail scores + stage GT; regen graphs with --export-tgn for row_idx/ioc_type)
+python scripts/eval_attack_reconstruction.py \
+  --scores-csv artifacts/tgn_runs/loso_holdout_sc5/best_eval_tail_scores.csv \
+  --stage-gt artifacts/stage_gt/sc5.stages_gt.json
+python scripts/merge_attack_reconstruction_summaries.py
+
 ```

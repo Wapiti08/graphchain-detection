@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from typing import TYPE_CHECKING
 
 from config.ontology import EdgeType, NodeType, edge_triplet
+from graph.edge_meta import edge_attrs_for_export
 from parsers.events import Event
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -102,7 +103,7 @@ def build_hetero_graph(
         edge_order[et].append(int(ev.order))
 
         if include_raw_attrs:
-            edge_attrs_raw[et].append(dict(ev.edge_attrs))
+            edge_attrs_raw[et].append(edge_attrs_for_export(ev))
 
         if ev.src_attrs:
             node_attrs_latest[s_type][s_idx] = {

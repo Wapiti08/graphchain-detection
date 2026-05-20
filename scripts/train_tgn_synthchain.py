@@ -14,6 +14,19 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKIN
 if TYPE_CHECKING:  # pragma: no cover
     import torch
 
+EVAL_TAIL_CSV_FIELDS = [
+    "scenario",
+    "t",
+    "etype",
+    "src",
+    "dst",
+    "score",
+    "is_ioc",
+    "source_file",
+    "row_idx",
+    "ioc_type",
+]
+
 
 @dataclass(frozen=True)
 class Stream:
@@ -24,6 +37,9 @@ class Stream:
     etype: "torch.Tensor"  # [E] int64
     y_ioc: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
     y_ioc_line: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
+    row_idx: Optional["torch.Tensor"] = None  # [E] int64 (-1 if unknown)
+    source_file: Optional[Tuple[str, ...]] = None
+    ioc_type: Optional[Tuple[str, ...]] = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -177,6 +193,8 @@ def _load_stream_from_tgn_pt(path: Path) -> Stream:
     import torch
 
     blob = torch.load(path, weights_only=True)
+    sf = blob.get("source_file")
+    it = blob.get("ioc_type")
     return Stream(
         src=blob["src"].long(),
         dst=blob["dst"].long(),
@@ -185,6 +203,9 @@ def _load_stream_from_tgn_pt(path: Path) -> Stream:
         etype=blob["etype"].long(),
         y_ioc=(blob.get("y_ioc").long() if blob.get("y_ioc") is not None else None),
         y_ioc_line=(blob.get("y_ioc_line").long() if blob.get("y_ioc_line") is not None else None),
+        row_idx=(blob.get("row_idx").long() if blob.get("row_idx") is not None else None),
+        source_file=(tuple(str(x) for x in sf) if sf is not None else None),
+        ioc_type=(tuple(str(x) for x in it) if it is not None else None),
     )
 
 
@@ -207,6 +228,9 @@ def _offset_stream_nodes(st: Stream, base: int) -> Stream:
         etype=st.etype,
         y_ioc=st.y_ioc,
         y_ioc_line=st.y_ioc_line,
+        row_idx=st.row_idx,
+        source_file=st.source_file,
+        ioc_type=st.ioc_type,
     )
 
 
@@ -495,6 +519,9 @@ def main() -> None:
         y_ioc = getattr(st, "y_ioc", None)
         if y_ioc is not None:
             y_ioc = y_ioc.to(device)
+        row_idx_cpu = getattr(st, "row_idx", None)
+        source_file = getattr(st, "source_file", None)
+        ioc_type = getattr(st, "ioc_type", None)
 
         split_idx = _time_split_idx(int(src.numel()), float(args.train_frac))
         lo, hi = (0, split_idx) if prefix_only else (split_idx, int(src.numel()))
@@ -604,10 +631,16 @@ def main() -> None:
                         lbl = y_ioc[i:j].to(torch.int64).detach().cpu()
                     else:
                         lbl = torch.zeros((int(pos_score.numel()),), dtype=torch.int64)
+                    ri_sl = row_idx_cpu[i:j] if row_idx_cpu is not None else None
+                    sf_sl = source_file[i:j] if source_file is not None else None
+                    it_sl = ioc_type[i:j] if ioc_type is not None else None
                     for k in range(int(pos_score.numel())):
                         y_true.append(int(lbl[k].item()))
                         y_score.append(float(pos_score[k].item()))
                         assert rows is not None
+                        ridx = int(ri_sl[k].item()) if ri_sl is not None else -1
+                        sf = str(sf_sl[k]) if sf_sl is not None else ""
+                        ityp = str(it_sl[k]) if it_sl is not None else ""
                         rows.append(
                             {
                                 "scenario": sc,
@@ -617,6 +650,9 @@ def main() -> None:
                                 "dst": int(d[k].item()),
                                 "score": float(pos_score[k].item()),
                                 "is_ioc": int(lbl[k].item()),
+                                "source_file": sf,
+                                "row_idx": ridx,
+                                "ioc_type": ityp,
                             }
                         )
 
@@ -727,7 +763,7 @@ def main() -> None:
         if bool(args.save_scores) or bool(args.save_scores_each_epoch):
             csv_path = out_dir / ("eval_tail_scores.csv" if bool(args.save_scores) else f"eval_tail_scores_epoch{ep:03d}.csv")
             with csv_path.open("w", newline="") as f:
-                w = DictWriter(f, fieldnames=["scenario", "t", "etype", "src", "dst", "score", "is_ioc"])
+                w = DictWriter(f, fieldnames=EVAL_TAIL_CSV_FIELDS)
                 w.writeheader()
                 for r in eval_rows:
                     w.writerow(r)
@@ -757,7 +793,7 @@ def main() -> None:
                 )
                 if eval_rows:
                     with best_scores_path.open("w", newline="") as f:
-                        w = DictWriter(f, fieldnames=["scenario", "t", "etype", "src", "dst", "score", "is_ioc"])
+                        w = DictWriter(f, fieldnames=EVAL_TAIL_CSV_FIELDS)
                         w.writeheader()
                         for r in eval_rows:
                             w.writerow(r)

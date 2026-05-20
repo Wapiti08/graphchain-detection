@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "description": "Mapping from MITRE ATT&CK tactics (Navigator 'tactic' field) to coarse attack stages used in GraphChain-Detection experiments.",
+  "stages": [
+    "resource_development",
+    "initial_access_delivery",
+    "execution",
+    "persistence_privilege_defense_evasion",
+    "discovery_collection",
+    "command_and_control",
+    "exfiltration_impact"
+  ],
+  "tactic_to_stage": {
+    "resource-development": "resource_development",
+    "reconnaissance": "resource_development",
+    "initial-access": "initial_access_delivery",
+    "execution": "execution",
+    "persistence": "persistence_privilege_defense_evasion",
+    "privilege-escalation": "persistence_privilege_defense_evasion",
+    "defense-evasion": "persistence_privilege_defense_evasion",
+    "credential-access": "discovery_collection",
+    "discovery": "discovery_collection",
+    "collection": "discovery_collection",
+    "lateral-movement": "discovery_collection",
+    "command-and-control": "command_and_control",
+    "exfiltration": "exfiltration_impact",
+    "impact": "exfiltration_impact"
+  }
+}
