@@ -25,6 +25,8 @@ EVAL_TAIL_CSV_FIELDS = [
     "source_file",
     "row_idx",
     "ioc_type",
+    "pred_stage",
+    "pred_stage_prob",
 ]
 
 
@@ -168,6 +170,18 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Margin for IOC ranking loss (anomaly score = -log sigmoid(pos_logit)).",
+    )
+    p.add_argument(
+        "--lambda-stage",
+        type=float,
+        default=0.0,
+        help="If >0, add stage classification CE loss on IOC edges with known stage labels (train prefix).",
+    )
+    p.add_argument(
+        "--stage-hidden-dim",
+        type=int,
+        default=64,
+        help="Hidden dim of the stage classifier MLP head.",
     )
     return p.parse_args()
 
@@ -396,6 +410,12 @@ def main() -> None:
     import torch.nn as nn
     import torch.nn.functional as F
     from graph.alert_eval import tail_alert_metrics
+    from graph.attack_reconstruct import (
+        NUM_STAGE_CLASSES,
+        IDX_TO_STAGE,
+        ioc_type_to_stage_idx,
+        load_ioc_type_to_stage,
+    )
     from torch_geometric.nn.models.tgn import IdentityMessage, LastAggregator, TGNMemory
 
     torch.manual_seed(int(args.seed))
@@ -487,7 +507,33 @@ def main() -> None:
         nn.Linear(int(args.memory_dim), 1),
     ).to(device)
 
-    opt = torch.optim.Adam(list(memory.parameters()) + list(link_pred.parameters()) + list(etype_emb.parameters()), lr=float(args.lr))
+    stage_pred: Optional[nn.Module] = None
+    use_stage = float(args.lambda_stage) > 0.0
+    if use_stage:
+        stage_inp_dim = 2 * int(args.memory_dim) + raw_msg_dim
+        stage_pred = nn.Sequential(
+            nn.Linear(stage_inp_dim, int(args.stage_hidden_dim)),
+            nn.ReLU(),
+            nn.Linear(int(args.stage_hidden_dim), NUM_STAGE_CLASSES),
+        ).to(device)
+
+    # Build per-edge stage label tensors (only meaningful when stage head is used).
+    _ioc_type_to_stage_map = load_ioc_type_to_stage(repo_root)
+    y_stage_per_sc: Dict[str, "torch.Tensor"] = {}
+    for sc in sorted(streams.keys()):
+        st = streams[sc]
+        it_tup = getattr(st, "ioc_type", None)
+        n = int(st.src.numel())
+        labels = torch.zeros(n, dtype=torch.long)
+        if it_tup is not None:
+            for idx_e in range(n):
+                labels[idx_e] = ioc_type_to_stage_idx(str(it_tup[idx_e]), _ioc_type_to_stage_map)
+        y_stage_per_sc[sc] = labels
+
+    all_params = list(memory.parameters()) + list(link_pred.parameters()) + list(etype_emb.parameters())
+    if stage_pred is not None:
+        all_params += list(stage_pred.parameters())
+    opt = torch.optim.Adam(all_params, lr=float(args.lr))
     assoc = torch.empty(num_nodes, dtype=torch.long, device=device).fill_(-1)
 
     def sample_neg(true_dst: "torch.Tensor", e: "torch.Tensor", pools: Dict[int, "torch.Tensor"]) -> "torch.Tensor":
@@ -535,14 +581,20 @@ def main() -> None:
         y_true: List[int] = []
         y_score: List[float] = []
 
+        y_stage_sc = y_stage_per_sc.get(sc)
+
         if train:
             memory.train()
             link_pred.train()
             etype_emb.train()
+            if stage_pred is not None:
+                stage_pred.train()
         else:
             memory.eval()
             link_pred.eval()
             etype_emb.eval()
+            if stage_pred is not None:
+                stage_pred.eval()
 
         # Prevent leakage across scenarios.
         memory.reset_state()
@@ -610,6 +662,16 @@ def main() -> None:
                     loss_ioc = F.relu(margin - (si - pair_sn)).mean()
                     loss = loss + float(args.lambda_ioc_rank) * loss_ioc
 
+            if train and use_stage and stage_pred is not None and y_stage_sc is not None:
+                stage_labels_batch = y_stage_sc[i:j].to(device)
+                has_label = stage_labels_batch > 0  # 0 = "none" / unlabeled
+                if int(has_label.sum().item()) > 0:
+                    stage_logits = stage_pred(pos_inp)
+                    loss_stage = F.cross_entropy(
+                        stage_logits[has_label], stage_labels_batch[has_label]
+                    )
+                    loss = loss + float(args.lambda_stage) * loss_stage
+
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -634,6 +696,23 @@ def main() -> None:
                     ri_sl = row_idx_cpu[i:j] if row_idx_cpu is not None else None
                     sf_sl = source_file[i:j] if source_file is not None else None
                     it_sl = ioc_type[i:j] if ioc_type is not None else None
+
+                    batch_pred_stages: List[str] = []
+                    batch_pred_probs: List[float] = []
+                    if stage_pred is not None:
+                        stage_logits = stage_pred(pos_inp)
+                        stage_probs = torch.softmax(stage_logits, dim=-1)
+                        stage_cls = torch.argmax(stage_probs, dim=-1).detach().cpu()
+                        stage_max_p = stage_probs.max(dim=-1).values.detach().cpu()
+                        for k in range(int(pos_score.numel())):
+                            cidx = int(stage_cls[k].item())
+                            batch_pred_stages.append(IDX_TO_STAGE.get(cidx, "none"))
+                            batch_pred_probs.append(float(stage_max_p[k].item()))
+                    else:
+                        for k in range(int(pos_score.numel())):
+                            batch_pred_stages.append("")
+                            batch_pred_probs.append(0.0)
+
                     for k in range(int(pos_score.numel())):
                         y_true.append(int(lbl[k].item()))
                         y_score.append(float(pos_score[k].item()))
@@ -653,6 +732,8 @@ def main() -> None:
                                 "source_file": sf,
                                 "row_idx": ridx,
                                 "ioc_type": ityp,
+                                "pred_stage": batch_pred_stages[k],
+                                "pred_stage_prob": f"{batch_pred_probs[k]:.4f}",
                             }
                         )
 
@@ -776,8 +857,7 @@ def main() -> None:
                 best_epoch = int(ep)
                 best_auroc_at_best = float(cur_auroc)
                 best_auprc_at_best = float(cur_auprc)
-                torch.save(
-                    {
+                ckpt_dict = {
                         "memory": memory.state_dict(),
                         "link_pred": link_pred.state_dict(),
                         "etype_emb": etype_emb.state_dict(),
@@ -788,9 +868,10 @@ def main() -> None:
                         "best_epoch": best_epoch,
                         "best_metric": best_metric,
                         "metric_name": args.select_metric,
-                    },
-                    best_ckpt_path,
-                )
+                    }
+                if stage_pred is not None:
+                    ckpt_dict["stage_pred"] = stage_pred.state_dict()
+                torch.save(ckpt_dict, best_ckpt_path)
                 if eval_rows:
                     with best_scores_path.open("w", newline="") as f:
                         w = DictWriter(f, fieldnames=EVAL_TAIL_CSV_FIELDS)
@@ -817,8 +898,7 @@ def main() -> None:
                             )
                             break
 
-    torch.save(
-        {
+    final_ckpt: Dict[str, object] = {
             "memory": memory.state_dict(),
             "link_pred": link_pred.state_dict(),
             "etype_emb": etype_emb.state_dict(),
@@ -826,7 +906,11 @@ def main() -> None:
             "train_scenarios": train_scenarios,
             "test_scenarios": test_scenarios,
             "scenario_base": scenario_base,
-        },
+    }
+    if stage_pred is not None:
+        final_ckpt["stage_pred"] = stage_pred.state_dict()
+    torch.save(
+        final_ckpt,
         out_dir / ("ckpt_holdout.pt" if args.holdout else "ckpt_joint.pt"),
     )
     if best_epoch is not None:

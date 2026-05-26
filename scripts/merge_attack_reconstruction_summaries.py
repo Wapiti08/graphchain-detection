@@ -49,6 +49,12 @@ def main() -> None:
             row[f"stage_recall@{k}"] = bk.get("stage_recall")
             row[f"stage_precision@{k}"] = bk.get("stage_precision")
             row[f"ordered_stage_recall_lcs@{k}"] = bk.get("ordered_stage_recall_lcs")
+        by_k_pred = data.get("by_k_predicted") or {}
+        for k in topks:
+            bk = by_k_pred.get(k) or {}
+            row[f"pred_stage_recall@{k}"] = bk.get("stage_recall")
+            row[f"pred_stage_precision@{k}"] = bk.get("stage_precision")
+            row[f"pred_ordered_lcs@{k}"] = bk.get("ordered_stage_recall_lcs")
         rows_out.append(row)
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)

@@ -18,6 +18,22 @@ DEFAULT_STAGE_ORDER: Tuple[str, ...] = (
     "exfiltration_impact",
 )
 
+STAGE_LABELS: Tuple[str, ...] = ("none",) + DEFAULT_STAGE_ORDER
+NUM_STAGE_CLASSES: int = len(STAGE_LABELS)  # 8: index 0 = none
+STAGE_TO_IDX: Dict[str, int] = {s: i for i, s in enumerate(STAGE_LABELS)}
+IDX_TO_STAGE: Dict[int, str] = {i: s for i, s in enumerate(STAGE_LABELS)}
+
+
+def ioc_type_to_stage_idx(
+    ioc_type: str,
+    ioc_type_to_stage: Mapping[str, str],
+) -> int:
+    """Return stage class index (0 = none) for a given IOC type string."""
+    if not ioc_type:
+        return 0
+    stage = ioc_type_to_stage.get(ioc_type, "")
+    return STAGE_TO_IDX.get(stage, 0)
+
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -103,6 +119,14 @@ def topk_edges(rows: Iterable[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
     return out
 
 
+def stage_for_edge_predicted(row: Mapping[str, Any]) -> str:
+    """Return model-predicted stage from the pred_stage CSV column (empty if absent/none)."""
+    ps = str(row.get("pred_stage") or "").strip()
+    if ps and ps != "none" and ps in STAGE_TO_IDX:
+        return ps
+    return ""
+
+
 def stages_from_topk(
     rows: Sequence[Dict[str, Any]],
     *,
@@ -110,15 +134,22 @@ def stages_from_topk(
     ioc_type_to_stage: Mapping[str, str],
     line_to_type: Mapping[Tuple[str, int], str],
     ioc_only: bool = True,
+    use_predicted: bool = False,
 ) -> Set[str]:
-    '''
-    map stages from top k identified suspicious edge 
-    '''
+    """Collect predicted stages from top-K edges.
+
+    When *use_predicted* is True, use the model's ``pred_stage`` column
+    for **all** edges (not just IOC).  Otherwise fall back to rule-based
+    lookup via ``stage_for_edge``.
+    """
     pred: Set[str] = set()
     for r in topk_edges(rows, k):
-        if ioc_only and int(r.get("is_ioc", 0)) != 1:
-            continue
-        st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
+        if use_predicted:
+            st = stage_for_edge_predicted(r)
+        else:
+            if ioc_only and int(r.get("is_ioc", 0)) != 1:
+                continue
+            st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
         if st:
             pred.add(st)
     return pred
@@ -153,13 +184,17 @@ def build_chain_segments(
     *,
     ioc_type_to_stage: Mapping[str, str],
     line_to_type: Mapping[Tuple[str, int], str],
+    use_predicted: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Time-ordered stage segments from IOC edges in top-K."""
+    """Time-ordered stage segments from edges in top-K."""
     labeled: List[Tuple[int, str, Dict[str, Any]]] = []
     for r in top_rows:
-        if int(r.get("is_ioc", 0)) != 1:
-            continue
-        st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
+        if use_predicted:
+            st = stage_for_edge_predicted(r)
+        else:
+            if int(r.get("is_ioc", 0)) != 1:
+                continue
+            st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
         if not st:
             continue
         labeled.append((int(r["t"]), st, dict(r)))
@@ -182,6 +217,58 @@ def build_chain_segments(
     return segments
 
 
+def _eval_one_mode(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    obs: Set[str],
+    gt_order: List[str],
+    ioc_type_to_stage: Mapping[str, str],
+    line_to_type: Mapping[Tuple[str, int], str],
+    topks: Sequence[int],
+    use_predicted: bool,
+) -> Dict[str, Any]:
+    by_k: Dict[str, Any] = {}
+    for k in topks:
+        pred = stages_from_topk(
+            rows,
+            k=int(k),
+            ioc_type_to_stage=ioc_type_to_stage,
+            line_to_type=line_to_type,
+            ioc_only=not use_predicted,
+            use_predicted=use_predicted,
+        )
+        pred_order = ordered_stage_sequence(pred)
+        inter = pred & obs
+        recall = float(len(inter)) / float(max(1, len(obs)))
+        precision = float(len(inter)) / float(max(1, len(pred))) if pred else 0.0
+        lcs_val = lcs_length(pred_order, gt_order)
+        ordered_recall = float(lcs_val) / float(max(1, len(gt_order)))
+        top_rows = topk_edges(rows, int(k))
+        by_k[str(int(k))] = {
+            "predicted_stages": sorted(pred),
+            "stage_recall": recall,
+            "stage_precision": precision,
+            "ordered_stage_recall_lcs": ordered_recall,
+            "lcs_length": int(lcs_val),
+            "chain_segments": build_chain_segments(
+                top_rows,
+                ioc_type_to_stage=ioc_type_to_stage,
+                line_to_type=line_to_type,
+                use_predicted=use_predicted,
+            ),
+        }
+    return by_k
+
+
+def _has_pred_stage(rows: Sequence[Dict[str, Any]]) -> bool:
+    """Check if any row has a non-empty pred_stage value."""
+    for r in rows[:200]:
+        ps = str(r.get("pred_stage") or "").strip()
+        if ps and ps != "none":
+            return True
+    return False
+
+
 def evaluate_reconstruction(
     *,
     rows: Sequence[Dict[str, Any]],
@@ -198,29 +285,26 @@ def evaluate_reconstruction(
         "observable_stages": sorted(obs),
         "semantic_stages": sorted(sem),
         "unobserved_semantic": sorted(sem - obs),
-        "by_k": {},
+        "by_k": _eval_one_mode(
+            rows,
+            obs=obs,
+            gt_order=gt_order,
+            ioc_type_to_stage=ioc_type_to_stage,
+            line_to_type=line_to_type,
+            topks=topks,
+            use_predicted=False,
+        ),
     }
 
-    for k in topks:
-        pred = stages_from_topk(
-            rows, k=int(k), ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type, ioc_only=True
+    if _has_pred_stage(rows):
+        metrics["by_k_predicted"] = _eval_one_mode(
+            rows,
+            obs=obs,
+            gt_order=gt_order,
+            ioc_type_to_stage=ioc_type_to_stage,
+            line_to_type=line_to_type,
+            topks=topks,
+            use_predicted=True,
         )
-        pred_order = ordered_stage_sequence(pred)
-        inter = pred & obs
-        recall = float(len(inter)) / float(max(1, len(obs)))
-        precision = float(len(inter)) / float(max(1, len(pred))) if pred else 0.0
-        lcs = lcs_length(pred_order, gt_order)
-        ordered_recall = float(lcs) / float(max(1, len(gt_order)))
-        top_rows = topk_edges(rows, int(k))
-        metrics["by_k"][str(int(k))] = {
-            "predicted_stages": sorted(pred),
-            "stage_recall": recall,
-            "stage_precision": precision,
-            "ordered_stage_recall_lcs": ordered_recall,
-            "lcs_length": int(lcs),
-            "chain_segments": build_chain_segments(
-                top_rows, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type
-            ),
-        }
 
     return metrics

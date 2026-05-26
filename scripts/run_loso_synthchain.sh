@@ -8,6 +8,9 @@
 #   EPOCHS=20 SEED=42 DEVICE=cuda \
 #     EXTRA_TRAIN_ARGS='--early-stop-patience 5 --early-stop-min-delta 0.001' \
 #     bash scripts/run_loso_synthchain.sh
+#   # With stage classifier (learned attack reconstruction):
+#   EXTRA_TRAIN_ARGS='--early-stop-patience 5 --early-stop-min-delta 0.001 --lambda-stage 0.5' \
+#     bash scripts/run_loso_synthchain.sh
 #   # Smoke / CI:
 #   EPOCHS=2 DEVICE=cpu bash scripts/run_loso_synthchain.sh
 #
