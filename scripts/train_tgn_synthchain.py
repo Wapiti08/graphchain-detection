@@ -84,7 +84,45 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--memory-dim", type=int, default=64)
     p.add_argument("--time-dim", type=int, default=32)
     p.add_argument("--etype-dim", type=int, default=16)
-    p.add_argument("--hard-neg", action="store_true")
+    p.add_argument(
+        "--neg-sampling",
+        type=str,
+        default="random",
+        choices=["random", "pool", "inbatch", "window"],
+        help=(
+            "Negative sampling strategy for self-supervised link prediction. "
+            "random: dst ~ Uniform[0,num_nodes); "
+            "pool: sample dst from per-etype pool built on train prefix (similar to --hard-neg); "
+            "inbatch: use other dst within the same batch (harder); "
+            "window: sample dst from same etype within a time window in the train prefix (hard, distribution-aware)."
+        ),
+    )
+    p.add_argument(
+        "--neg-window-seconds",
+        type=int,
+        default=3600,
+        help="Time window (seconds) for --neg-sampling window (uses train prefix pools).",
+    )
+    p.add_argument(
+        "--neg-window-max-cands",
+        type=int,
+        default=4096,
+        help="Cap the number of candidates considered per edge for --neg-sampling window (0 = no cap).",
+    )
+    # Backward-compatible alias (older scripts may pass --hard-neg).
+    p.add_argument(
+        "--hard-neg",
+        action="store_true",
+        help="DEPRECATED: use --neg-sampling pool instead.",
+    )
+    p.add_argument(
+        "--train-only-benign",
+        action="store_true",
+        help=(
+            "During training (prefix only), exclude IOC-labeled edges from loss and memory updates "
+            "when y_ioc is available. This makes the self-supervised objective focus on normal behavior."
+        ),
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--graphs-dir", type=str, default="artifacts/graphs")
     p.add_argument("--out", type=str, default="artifacts/tgn_runs/synthchain_multi")
@@ -124,8 +162,16 @@ def _parse_args() -> argparse.Namespace:
         "--select-metric",
         type=str,
         default="auprc",
-        choices=["auprc", "auroc"],
-        help="Metric to select and save the best checkpoint (requires --eval-ioc).",
+        help=(
+            "Metric for best checkpoint / early stopping (requires --eval-ioc): "
+            "auprc, auroc, p_at (uses --select-p-at-k), or p_at_<K> e.g. p_at_100."
+        ),
+    )
+    p.add_argument(
+        "--select-p-at-k",
+        type=int,
+        default=100,
+        help="K for --select-metric p_at (ignored for p_at_<K> or auprc/auroc).",
     )
     p.add_argument(
         "--early-stop-patience",
@@ -183,7 +229,21 @@ def _parse_args() -> argparse.Namespace:
         default=64,
         help="Hidden dim of the stage classifier MLP head.",
     )
-    return p.parse_args()
+    p.add_argument(
+        "--aux-supervision",
+        type=str,
+        default="train_only",
+        choices=["train_only", "off"],
+        help=(
+            "IOC rank / stage CE auxiliary losses: train_only = only on --train scenarios "
+            "(holdout scenario never gets aux gradients; per-scenario run uses that scenario). "
+            "off = pure self-supervised link prediction."
+        ),
+    )
+    args = p.parse_args()
+    if bool(getattr(args, "hard_neg", False)):
+        args.neg_sampling = "pool"
+    return args
 
 
 def _parse_scenarios(s: str) -> List[str]:
@@ -319,6 +379,87 @@ def _build_neg_pools(
     return pools
 
 
+def _build_time_pools(
+    dst: "torch.Tensor",  # [E]
+    t: "torch.Tensor",  # [E]
+    etype: "torch.Tensor",  # [E]
+    split_idx: int,
+) -> Dict[int, Tuple["torch.Tensor", "torch.Tensor"]]:
+    """Per-etype (t_sorted, dst_sorted) pools built from the train prefix."""
+    import torch
+
+    pools: Dict[int, Tuple["torch.Tensor", "torch.Tensor"]] = {}
+    if int(split_idx) <= 0:
+        return pools
+    for e in torch.unique(etype[:split_idx]).tolist():
+        ei = int(e)
+        mask = (etype[:split_idx] == ei)
+        tt = t[:split_idx][mask]
+        dd = dst[:split_idx][mask]
+        if int(tt.numel()) == 0:
+            continue
+        order = torch.argsort(tt)
+        pools[ei] = (tt[order], dd[order])
+    return pools
+
+
+def _sample_window_neg_dst(
+    true_dst: "torch.Tensor",  # scalar
+    true_t: "torch.Tensor",  # scalar
+    e: "torch.Tensor",  # scalar
+    time_pools: Dict[int, Tuple["torch.Tensor", "torch.Tensor"]],
+    *,
+    window_seconds: int,
+    max_cands: int,
+) -> "torch.Tensor":
+    """Sample a hard negative dst from same etype within a time window."""
+    import torch
+
+    ei = int(e.item())
+    if ei not in time_pools:
+        return true_dst.clone()
+    pool_t, pool_d = time_pools[ei]
+    if int(pool_t.numel()) <= 1:
+        return true_dst.clone()
+
+    w = int(max(0, window_seconds))
+    center = int(true_t.item())
+    lo_t = center - w
+    hi_t = center + w
+    # pool_t is sorted.
+    lo = int(torch.searchsorted(pool_t, torch.tensor(lo_t, device=pool_t.device), right=False).item())
+    hi = int(torch.searchsorted(pool_t, torch.tensor(hi_t, device=pool_t.device), right=True).item())
+    if hi - lo <= 1:
+        return true_dst.clone()
+    cand = pool_d[lo:hi]
+    if int(max_cands) > 0 and int(cand.numel()) > int(max_cands):
+        j0 = torch.randint(0, int(cand.numel() - int(max_cands) + 1), (1,), device=cand.device).item()
+        cand = cand[int(j0) : int(j0) + int(max_cands)]
+
+    j = torch.randint(0, int(cand.numel()), (1,), device=cand.device)
+    neg = cand[j].view_as(true_dst)
+    if int(neg.item()) == int(true_dst.item()):
+        neg = cand[(j + 1) % int(cand.numel())].view_as(true_dst)
+    return neg
+
+
+def _inbatch_neg_dst(dst: "torch.Tensor") -> "torch.Tensor":
+    """Return a per-edge negative destination by permuting within batch."""
+    import torch
+
+    n = int(dst.numel())
+    if n <= 1:
+        return dst.clone()
+    perm = torch.randperm(n, device=dst.device)
+    neg = dst[perm]
+    # Avoid trivial self-match; if equal, shift by 1.
+    eq = neg.eq(dst)
+    if bool(eq.any().item()):
+        neg2 = torch.roll(neg, shifts=1, dims=0)
+        neg = torch.where(eq, neg2, neg)
+    return neg
+
+
 def _roc_auc(y_true: List[int], y_score: List[float]) -> float:
     # Returns AUROC in [0,1]. If undefined (only one class), returns NaN.
     if not y_true:
@@ -387,6 +528,45 @@ def _parse_topk(s: str) -> List[int]:
     return sorted(set(out))
 
 
+def _resolve_p_at_k(select_metric: str, select_p_at_k: int) -> Optional[int]:
+    """Return K when selection uses tail p@K; None for auprc/auroc."""
+    sm = str(select_metric).strip().lower()
+    if sm == "p_at":
+        return max(1, int(select_p_at_k))
+    if sm.startswith("p_at_"):
+        try:
+            return max(1, int(sm[5:]))
+        except ValueError:
+            return None
+    return None
+
+
+def _selection_metric_label(select_metric: str, select_p_at_k: int) -> str:
+    pk = _resolve_p_at_k(select_metric, select_p_at_k)
+    if pk is not None:
+        return f"p_at_{pk}"
+    return str(select_metric)
+
+
+def _selection_score(
+    select_metric: str,
+    select_p_at_k: int,
+    *,
+    cur_auroc: float,
+    cur_auprc: float,
+    tail_eval: Dict[str, float],
+) -> float:
+    pk = _resolve_p_at_k(select_metric, select_p_at_k)
+    if pk is not None:
+        return float(tail_eval.get(f"p_at_{pk}", float("nan")))
+    sm = str(select_metric).strip().lower()
+    if sm == "auprc":
+        return float(cur_auprc)
+    if sm == "auroc":
+        return float(cur_auroc)
+    return float("nan")
+
+
 def _topk_ioc_hits(eval_rows: List[Dict[str, object]], ks: Sequence[int]) -> Dict[int, int]:
     rows = sorted(eval_rows, key=lambda r: float(r["score"]), reverse=True)
     out: Dict[int, int] = {}
@@ -432,14 +612,25 @@ def main() -> None:
     if int(args.early_stop_patience) > 0 and not bool(args.eval_ioc):
         print("warning: --early-stop-patience is ignored without --eval-ioc.", flush=True)
 
+    train_scenarios_set: set[str]
     if args.holdout:
         holdout = args.holdout.strip()
         train_scenarios = [s for s in scenario_universe if s != holdout]
         test_scenarios = [holdout]
     else:
-        # Joint training/validation within each scenario (time-split).
+        # Joint or single-scenario: train/val lists match --scenarios.
         train_scenarios = list(scenario_universe)
         test_scenarios = list(scenario_universe)
+    train_scenarios_set = set(train_scenarios)
+
+    if args.holdout:
+        eval_protocol = "loso_holdout"
+    elif len(test_scenarios) == 1 and set(train_scenarios) == {test_scenarios[0]}:
+        eval_protocol = "per_scenario"
+    else:
+        eval_protocol = "joint_multi"
+
+    use_aux_supervision = str(args.aux_supervision) != "off"
 
     streams: Dict[str, Stream] = {}
     for sc in sorted(set(train_scenarios + test_scenarios)):
@@ -537,7 +728,7 @@ def main() -> None:
     assoc = torch.empty(num_nodes, dtype=torch.long, device=device).fill_(-1)
 
     def sample_neg(true_dst: "torch.Tensor", e: "torch.Tensor", pools: Dict[int, "torch.Tensor"]) -> "torch.Tensor":
-        if args.hard_neg and int(e.item()) in pools and pools[int(e.item())].numel() > 1:
+        if str(args.neg_sampling) == "pool" and int(e.item()) in pools and pools[int(e.item())].numel() > 1:
             pool = pools[int(e.item())].to(true_dst.device)
             j = torch.randint(0, int(pool.numel()), (1,), device=true_dst.device)
             neg = pool[j].view_as(true_dst)
@@ -572,7 +763,12 @@ def main() -> None:
         split_idx = _time_split_idx(int(src.numel()), float(args.train_frac))
         lo, hi = (0, split_idx) if prefix_only else (split_idx, int(src.numel()))
 
-        pools = _build_neg_pools(dst, etype, split_idx) if args.hard_neg else {}
+        pools = _build_neg_pools(dst, etype, split_idx) if str(args.neg_sampling) == "pool" else {}
+        time_pools = (
+            _build_time_pools(dst, t, etype, split_idx)
+            if str(args.neg_sampling) == "window"
+            else {}
+        )
 
         total_loss = 0.0
         correct = 0.0
@@ -625,7 +821,26 @@ def main() -> None:
             m = msg[i:j]
             e = etype[i:j]
 
-            neg_d = torch.stack([sample_neg(d[k : k + 1], e[k : k + 1], pools).view(()) for k in range(int(d.numel()))])
+            if str(args.neg_sampling) == "inbatch":
+                neg_d = _inbatch_neg_dst(d)
+            elif str(args.neg_sampling) == "window":
+                neg_d = torch.stack(
+                    [
+                        _sample_window_neg_dst(
+                            d[k : k + 1],
+                            tt[k : k + 1],
+                            e[k : k + 1],
+                            time_pools,
+                            window_seconds=int(args.neg_window_seconds),
+                            max_cands=int(args.neg_window_max_cands),
+                        ).view(())
+                        for k in range(int(d.numel()))
+                    ]
+                )
+            else:
+                neg_d = torch.stack(
+                    [sample_neg(d[k : k + 1], e[k : k + 1], pools).view(()) for k in range(int(d.numel()))]
+                )
             eemb = etype_emb(e)
             raw_msg = torch.cat([m, eemb], dim=-1)
 
@@ -643,11 +858,36 @@ def main() -> None:
             pos_logit = link_pred(pos_inp).view(-1)
             neg_logit = link_pred(neg_inp).view(-1)
 
-            y = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)], dim=0)
-            logit = torch.cat([pos_logit, neg_logit], dim=0)
-            loss = F.binary_cross_entropy_with_logits(logit, y)
+            benign_mask: Optional["torch.Tensor"] = None
+            if (
+                bool(args.train_only_benign)
+                and train
+                and prefix_only
+                and (y_ioc is not None)
+            ):
+                benign_mask = (y_ioc[i:j] == 0)
 
-            if train and float(args.lambda_ioc_rank) > 0.0 and y_ioc is not None:
+            if benign_mask is not None:
+                if int(benign_mask.sum().item()) == 0:
+                    # Still update memory below (skipping IOC edges too) and continue.
+                    loss = None
+                else:
+                    pos_logit_eff = pos_logit[benign_mask]
+                    neg_logit_eff = neg_logit[benign_mask]
+                    y = torch.cat([torch.ones_like(pos_logit_eff), torch.zeros_like(neg_logit_eff)], dim=0)
+                    logit = torch.cat([pos_logit_eff, neg_logit_eff], dim=0)
+                    loss = F.binary_cross_entropy_with_logits(logit, y)
+            else:
+                y = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)], dim=0)
+                logit = torch.cat([pos_logit, neg_logit], dim=0)
+                loss = F.binary_cross_entropy_with_logits(logit, y)
+
+            aux_active = (
+                use_aux_supervision
+                and train
+                and (sc in train_scenarios_set)
+            )
+            if loss is not None and aux_active and float(args.lambda_ioc_rank) > 0.0 and y_ioc is not None:
                 yb = y_ioc[i:j].float()
                 pos_prob = torch.sigmoid(pos_logit).view(-1)
                 score_anom = -torch.log(pos_prob.clamp_min(1e-12))
@@ -662,7 +902,7 @@ def main() -> None:
                     loss_ioc = F.relu(margin - (si - pair_sn)).mean()
                     loss = loss + float(args.lambda_ioc_rank) * loss_ioc
 
-            if train and use_stage and stage_pred is not None and y_stage_sc is not None:
+            if loss is not None and aux_active and use_stage and stage_pred is not None and y_stage_sc is not None:
                 stage_labels_batch = y_stage_sc[i:j].to(device)
                 has_label = stage_labels_batch > 0  # 0 = "none" / unlabeled
                 if int(has_label.sum().item()) > 0:
@@ -672,17 +912,27 @@ def main() -> None:
                     )
                     loss = loss + float(args.lambda_stage) * loss_stage
 
-            if train:
+            if train and loss is not None:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
 
             with torch.no_grad():
-                prob = torch.sigmoid(logit)
-                pred = (prob > 0.5).float()
-                correct += float((pred == y).sum().item())
-                count += float(y.numel())
-                total_loss += float(loss.item()) * float(y.numel())
+                if benign_mask is not None:
+                    # For training-only-benign, track metrics on the same effective edges.
+                    if int(benign_mask.sum().item()) > 0:
+                        prob = torch.sigmoid(logit)
+                        pred = (prob > 0.5).float()
+                        correct += float((pred == y).sum().item())
+                        count += float(y.numel())
+                        assert loss is not None
+                        total_loss += float(loss.item()) * float(y.numel())
+                else:
+                    prob = torch.sigmoid(logit)
+                    pred = (prob > 0.5).float()
+                    correct += float((pred == y).sum().item())
+                    count += float(y.numel())
+                    total_loss += float(loss.item()) * float(y.numel())
 
                 if collect_eval:
                     # score only the positive (real) edges
@@ -737,7 +987,12 @@ def main() -> None:
                             }
                         )
 
-            memory.update_state(s, d, tt, raw_msg.detach())
+            if benign_mask is not None:
+                # Exclude IOC-labeled edges from memory updates during training.
+                if int(benign_mask.sum().item()) > 0:
+                    memory.update_state(s[benign_mask], d[benign_mask], tt[benign_mask], raw_msg[benign_mask].detach())
+            else:
+                memory.update_state(s, d, tt, raw_msg.detach())
 
         metrics = None
         if collect_eval and bool(args.eval_ioc):
@@ -748,6 +1003,22 @@ def main() -> None:
     out_dir = (repo_root / args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     topks = _parse_topk(args.topk)
+    select_p_at_k = _resolve_p_at_k(args.select_metric, int(args.select_p_at_k))
+    if select_p_at_k is not None:
+        if not bool(args.eval_ioc):
+            raise SystemExit("--select-metric p_at* requires --eval-ioc.")
+        if select_p_at_k not in topks:
+            topks = sorted(set(topks) | {select_p_at_k})
+            print(
+                f"note: added K={select_p_at_k} to --topk for checkpoint selection "
+                f"(now {topks}).",
+                flush=True,
+            )
+    elif str(args.select_metric).strip().lower() not in ("auprc", "auroc"):
+        raise SystemExit(
+            f"Unknown --select-metric {args.select_metric!r}; use auprc, auroc, p_at, or p_at_<K>."
+        )
+    metric_label = _selection_metric_label(args.select_metric, int(args.select_p_at_k))
 
     best_metric = float("-inf")
     best_epoch: Optional[int] = None
@@ -851,7 +1122,13 @@ def main() -> None:
 
         # Best checkpoint selection (requires eval-ioc)
         if bool(args.eval_ioc):
-            cur = cur_auprc if args.select_metric == "auprc" else cur_auroc
+            cur = _selection_score(
+                args.select_metric,
+                int(args.select_p_at_k),
+                cur_auroc=cur_auroc,
+                cur_auprc=cur_auprc,
+                tail_eval=epoch_tail_eval,
+            )
             if not math.isnan(cur) and cur > best_metric:
                 best_metric = float(cur)
                 best_epoch = int(ep)
@@ -867,7 +1144,7 @@ def main() -> None:
                         "scenario_base": scenario_base,
                         "best_epoch": best_epoch,
                         "best_metric": best_metric,
-                        "metric_name": args.select_metric,
+                        "metric_name": metric_label,
                     }
                 if stage_pred is not None:
                     ckpt_dict["stage_pred"] = stage_pred.state_dict()
@@ -883,7 +1160,13 @@ def main() -> None:
 
             # Early stopping on validation tail metric (same as --select-metric)
             if int(args.early_stop_patience) > 0:
-                cur_es = cur_auprc if args.select_metric == "auprc" else cur_auroc
+                cur_es = _selection_score(
+                    args.select_metric,
+                    int(args.select_p_at_k),
+                    cur_auroc=cur_auroc,
+                    cur_auprc=cur_auprc,
+                    tail_eval=epoch_tail_eval,
+                )
                 if not math.isnan(cur_es):
                     if cur_es > es_best + float(args.early_stop_min_delta):
                         es_best = float(cur_es)
@@ -892,7 +1175,7 @@ def main() -> None:
                         es_patience += 1
                         if es_patience >= int(args.early_stop_patience):
                             print(
-                                f"early_stop: {args.select_metric} did not improve by "
+                                f"early_stop: {metric_label} did not improve by "
                                 f">{args.early_stop_min_delta} for {args.early_stop_patience} epochs "
                                 f"(best_seen={es_best:.4f}). Stopping at epoch {ep:03d}."
                             )
@@ -914,7 +1197,7 @@ def main() -> None:
         out_dir / ("ckpt_holdout.pt" if args.holdout else "ckpt_joint.pt"),
     )
     if best_epoch is not None:
-        print(f"Best by {args.select_metric}: epoch {best_epoch} = {best_metric:.4f}")
+        print(f"Best by {metric_label}: epoch {best_epoch} = {best_metric:.4f}")
     if int(args.early_stop_patience) > 0 and last_completed_epoch < int(args.epochs):
         print(f"Completed {last_completed_epoch}/{int(args.epochs)} epochs (early stopping).")
 
@@ -927,11 +1210,22 @@ def main() -> None:
     if best_epoch is not None and not math.isinf(float(best_metric)):
         best_metric_out = float(best_metric)
 
+    primary_scenario = (
+        str(args.holdout).strip()
+        if args.holdout
+        else (test_scenarios[0] if len(test_scenarios) == 1 else "")
+    )
+
     summary = {
+        "eval_protocol": eval_protocol,
+        "scenario": primary_scenario,
         "holdout": str(args.holdout) if args.holdout else "",
         "scenarios": list(scenario_universe),
         "train_scenarios": train_scenarios,
         "test_scenarios": test_scenarios,
+        "aux_supervision": str(args.aux_supervision),
+        "lambda_ioc_rank": float(args.lambda_ioc_rank),
+        "lambda_stage": float(args.lambda_stage),
         "epochs": int(args.epochs),
         "epochs_completed": int(last_completed_epoch),
         "early_stopped": bool(last_completed_epoch < int(args.epochs)),
@@ -939,6 +1233,8 @@ def main() -> None:
         "early_stop_min_delta": float(args.early_stop_min_delta),
         "seed": int(args.seed),
         "select_metric": str(args.select_metric),
+        "select_metric_label": metric_label,
+        "select_p_at_k": int(args.select_p_at_k),
         "best_epoch": best_epoch,
         "best_metric": best_metric_out,
         "best_auroc": _jf(best_auroc_at_best),

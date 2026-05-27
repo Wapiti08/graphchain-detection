@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge per-fold run_summary.json from LOSO runs into one CSV."""
+"""Merge per-run run_summary.json from TGN experiments (LOSO, per-scenario, etc.) into one CSV."""
 from __future__ import annotations
 
 import argparse
@@ -30,13 +30,19 @@ def main() -> None:
         "--pattern",
         type=str,
         default="loso_holdout_*",
-        help="Glob under runs-root for fold directories.",
+        help="Glob under runs-root for run directories.",
     )
     p.add_argument(
         "--out-csv",
         type=str,
         default="artifacts/tgn_runs/loso_summary.csv",
         help="Output CSV path (relative to repo root).",
+    )
+    p.add_argument(
+        "--require-protocol",
+        type=str,
+        default="",
+        help="If set, only include runs whose eval_protocol matches (e.g. per_scenario, loso_holdout).",
     )
     args = p.parse_args()
     repo = Path(__file__).resolve().parents[1]
@@ -55,12 +61,21 @@ def main() -> None:
         if not js.is_file():
             continue
         data = json.loads(js.read_text(encoding="utf-8"))
-        holdout = str(data.get("holdout") or "")
-        if not holdout:
+        if args.require_protocol:
+            if str(data.get("eval_protocol") or "") != str(args.require_protocol):
+                continue
+        scenario = str(data.get("scenario") or data.get("holdout") or "").strip()
+        if not scenario:
+            ts = data.get("test_scenarios") or []
+            if isinstance(ts, list) and len(ts) == 1:
+                scenario = str(ts[0])
+        if not scenario:
             continue
 
         base: Dict[str, object] = {
-            "holdout": holdout,
+            "scenario": scenario,
+            "eval_protocol": data.get("eval_protocol"),
+            "holdout": data.get("holdout") or "",
             "best_epoch": data.get("best_epoch"),
             "best_metric": data.get("best_metric"),
             "select_metric": data.get("select_metric"),
@@ -87,6 +102,8 @@ def main() -> None:
         rows.append(base)
 
     core = [
+        "scenario",
+        "eval_protocol",
         "holdout",
         "best_epoch",
         "best_metric",

@@ -121,15 +121,22 @@ python scripts/generate_graph.py --dataset synthchain --scenario sc1 --export-tg
 # train/validate on sc1 with strict time split (past -> future)
 python scripts/train_tgn_sc1.py --epochs 5 --batch-size 256
 
-# joint training across all scenarios (per-scenario time split)
+# PRIMARY: per-scenario eval (SSL on prefix, test tail; same scenario train+test)
+# Optional weak aux: EXTRA_TRAIN_ARGS='--lambda-stage 0.5 --lambda-ioc-rank 0.1'
+# RUN_RECON=1 also writes per_scenario_reconstruction_summary.csv
+bash scripts/run_per_scenario_eval.sh
+
+# single scenario via train_tgn_synthchain (equivalent to one fold above)
+python scripts/train_tgn_synthchain.py --scenarios sc1 --epochs 5 --batch-size 256 --auto-generate --eval-ioc --warmup
+
+# joint training across all scenarios (ablation; not the primary protocol)
 python scripts/train_tgn_synthchain.py --epochs 5 --batch-size 256 --auto-generate
 
-# strict cross-scenario generalization: hold out one scenario (example: test on sc3)
-python scripts/train_tgn_synthchain.py --holdout sc3 --epochs 5 --batch-size 256 --auto-generate
-
-# LOSO (all folds sc1..sc7); writes artifacts/tgn_runs/loso_holdout_*/run_summary.json and loso_summary.csv
-# Optional: EPOCHS=10 SEED=1 bash scripts/run_loso_synthchain.sh
+# LOSO stress test: train 6 scenarios, test holdout (cross-attack-family transfer lower bound)
 bash scripts/run_loso_synthchain.sh
+
+# pure self-supervised (no IOC rank / stage CE on train scenarios):
+# EXTRA_TRAIN_ARGS='--aux-supervision off' bash scripts/run_per_scenario_eval.sh
 
 # Optional: shallow IOC supervision (margin on anomaly score vs non-IOC in same batch)
 # python scripts/train_tgn_synthchain.py --holdout sc3 --eval-ioc --warmup --lambda-ioc-rank 0.1 --ioc-rank-margin 0.5 ...
@@ -146,8 +153,10 @@ python3 scripts/build_synthchain_stage_gt.py --out-dir artifacts/stage_gt
 
 # partial attack-chain reconstruction (needs tail scores + stage GT; regen graphs with --export-tgn for row_idx/ioc_type)
 python scripts/eval_attack_reconstruction.py \
-  --scores-csv artifacts/tgn_runs/loso_holdout_sc5/best_eval_tail_scores.csv \
+  --scores-csv artifacts/tgn_runs/per_scenario_sc5/best_eval_tail_scores.csv \
   --stage-gt artifacts/stage_gt/sc5.stages_gt.json
-python scripts/merge_attack_reconstruction_summaries.py
+python scripts/merge_attack_reconstruction_summaries.py \
+  --pattern "per_scenario_*" \
+  --out-csv artifacts/tgn_runs/per_scenario_reconstruction_summary.csv
 
 ```
