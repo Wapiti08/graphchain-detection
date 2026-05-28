@@ -40,6 +40,18 @@ def main() -> None:
         help="IOC ground truth for line-level type fallback.",
     )
     p.add_argument("--topks", type=str, default="10,50,100,500", help="Comma-separated K values.")
+    p.add_argument(
+        "--pred-min-prob",
+        type=float,
+        default=0.0,
+        help="For by_k_predicted: require pred_stage_prob >= this threshold (0 = disabled).",
+    )
+    p.add_argument(
+        "--pred-min-count",
+        type=int,
+        default=1,
+        help="For by_k_predicted: require at least this many edges of a stage in top-K to include the stage.",
+    )
     p.add_argument("--out", type=str, default="", help="Output JSON (default: beside scores as reconstruction_metrics.json).")
     args = p.parse_args()
 
@@ -69,6 +81,8 @@ def main() -> None:
         ioc_type_to_stage=ioc_type_to_stage,
         line_to_type=line_to_type,
         topks=topks,
+        pred_min_prob=float(args.pred_min_prob),
+        pred_min_count=int(args.pred_min_count),
     )
     metrics["scenario"] = scenario
     metrics["scores_csv"] = str(scores_csv)

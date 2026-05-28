@@ -119,9 +119,19 @@ def topk_edges(rows: Iterable[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
     return out
 
 
-def stage_for_edge_predicted(row: Mapping[str, Any]) -> str:
-    """Return model-predicted stage from the pred_stage CSV column (empty if absent/none)."""
+def stage_for_edge_predicted(row: Mapping[str, Any], *, min_prob: float = 0.0) -> str:
+    """Return model-predicted stage from the pred_stage CSV column (empty if absent/none).
+
+    When min_prob > 0, require pred_stage_prob >= min_prob to accept the stage.
+    """
     ps = str(row.get("pred_stage") or "").strip()
+    if float(min_prob) > 0.0:
+        try:
+            p = float(row.get("pred_stage_prob") or 0.0)
+        except Exception:
+            p = 0.0
+        if p < float(min_prob):
+            return ""
     if ps and ps != "none" and ps in STAGE_TO_IDX:
         return ps
     return ""
@@ -135,6 +145,8 @@ def stages_from_topk(
     line_to_type: Mapping[Tuple[str, int], str],
     ioc_only: bool = True,
     use_predicted: bool = False,
+    pred_min_prob: float = 0.0,
+    pred_min_count: int = 1,
 ) -> Set[str]:
     """Collect predicted stages from top-K edges.
 
@@ -142,17 +154,18 @@ def stages_from_topk(
     for **all** edges (not just IOC).  Otherwise fall back to rule-based
     lookup via ``stage_for_edge``.
     """
-    pred: Set[str] = set()
+    counts: Dict[str, int] = {}
     for r in topk_edges(rows, k):
         if use_predicted:
-            st = stage_for_edge_predicted(r)
+            st = stage_for_edge_predicted(r, min_prob=float(pred_min_prob))
         else:
             if ioc_only and int(r.get("is_ioc", 0)) != 1:
                 continue
             st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
         if st:
-            pred.add(st)
-    return pred
+            counts[st] = counts.get(st, 0) + 1
+    minc = max(1, int(pred_min_count))
+    return set([s for s, c in counts.items() if int(c) >= minc])
 
 
 def ordered_stage_sequence(stages: Set[str], order: Sequence[str] = DEFAULT_STAGE_ORDER) -> List[str]:
@@ -185,12 +198,13 @@ def build_chain_segments(
     ioc_type_to_stage: Mapping[str, str],
     line_to_type: Mapping[Tuple[str, int], str],
     use_predicted: bool = False,
+    pred_min_prob: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Time-ordered stage segments from edges in top-K."""
     labeled: List[Tuple[int, str, Dict[str, Any]]] = []
     for r in top_rows:
         if use_predicted:
-            st = stage_for_edge_predicted(r)
+            st = stage_for_edge_predicted(r, min_prob=float(pred_min_prob))
         else:
             if int(r.get("is_ioc", 0)) != 1:
                 continue
@@ -226,6 +240,8 @@ def _eval_one_mode(
     line_to_type: Mapping[Tuple[str, int], str],
     topks: Sequence[int],
     use_predicted: bool,
+    pred_min_prob: float,
+    pred_min_count: int,
 ) -> Dict[str, Any]:
     by_k: Dict[str, Any] = {}
     for k in topks:
@@ -236,6 +252,8 @@ def _eval_one_mode(
             line_to_type=line_to_type,
             ioc_only=not use_predicted,
             use_predicted=use_predicted,
+            pred_min_prob=float(pred_min_prob),
+            pred_min_count=int(pred_min_count),
         )
         pred_order = ordered_stage_sequence(pred)
         inter = pred & obs
@@ -255,6 +273,7 @@ def _eval_one_mode(
                 ioc_type_to_stage=ioc_type_to_stage,
                 line_to_type=line_to_type,
                 use_predicted=use_predicted,
+                pred_min_prob=float(pred_min_prob),
             ),
         }
     return by_k
@@ -276,6 +295,8 @@ def evaluate_reconstruction(
     ioc_type_to_stage: Mapping[str, str],
     line_to_type: Mapping[Tuple[str, int], str],
     topks: Sequence[int] = (10, 50, 100),
+    pred_min_prob: float = 0.0,
+    pred_min_count: int = 1,
 ) -> Dict[str, Any]:
     obs = set((stages_gt.get("observable") or {}).get("stages") or [])
     sem = set((stages_gt.get("semantic") or {}).get("stages") or [])
@@ -293,6 +314,8 @@ def evaluate_reconstruction(
             line_to_type=line_to_type,
             topks=topks,
             use_predicted=False,
+            pred_min_prob=0.0,
+            pred_min_count=1,
         ),
     }
 
@@ -305,6 +328,8 @@ def evaluate_reconstruction(
             line_to_type=line_to_type,
             topks=topks,
             use_predicted=True,
+            pred_min_prob=float(pred_min_prob),
+            pred_min_count=int(pred_min_count),
         )
 
     return metrics
