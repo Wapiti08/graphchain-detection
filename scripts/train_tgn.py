@@ -1,4 +1,3 @@
-"""CLI shim — graph construction lives in gchain.pipeline."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,7 +7,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from gchain.pipeline.runner import cli_main
+from gchain.train.runner import cli_main
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ if [[ ! -d "${ROOT}/data/SynthChain" ]]; then
 fi
 
 echo "==> generate sc1 graph + TGN export (limited rows, fast)"
-"${PY}" scripts/generate_graph.py \
+"${PY}" -m gchain.pipeline \
   --dataset synthchain \
   --scenario sc1 \
   --export-tgn \

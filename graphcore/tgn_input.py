@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
-from graph.edge_meta import primary_ioc_type_from_attrs
+from graphcore.edge_meta import primary_ioc_type_from_attrs
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch

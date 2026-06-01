@@ -49,12 +49,29 @@ def main() -> None:
             row[f"stage_recall@{k}"] = bk.get("stage_recall")
             row[f"stage_precision@{k}"] = bk.get("stage_precision")
             row[f"ordered_stage_recall_lcs@{k}"] = bk.get("ordered_stage_recall_lcs")
-        by_k_pred = data.get("by_k_predicted") or {}
-        for k in topks:
-            bk = by_k_pred.get(k) or {}
-            row[f"pred_stage_recall@{k}"] = bk.get("stage_recall")
-            row[f"pred_stage_precision@{k}"] = bk.get("stage_precision")
-            row[f"pred_ordered_lcs@{k}"] = bk.get("ordered_stage_recall_lcs")
+        by_k_pred = data.get("by_k_pred_stage") or data.get("by_k_predicted") or {}
+        if isinstance(by_k_pred, dict) and by_k_pred.get("available") is not False:
+            for k in topks:
+                bk = by_k_pred.get(k) or {}
+                row[f"pred_stage_recall@{k}"] = bk.get("stage_recall")
+                row[f"pred_stage_precision@{k}"] = bk.get("stage_precision")
+                row[f"pred_ordered_lcs@{k}"] = bk.get("ordered_stage_recall_lcs")
+        blk_pd = data.get("by_k_pair_dedupe") or {}
+        if isinstance(blk_pd, dict) and blk_pd:
+            for k in topks:
+                bk = blk_pd.get(k) or {}
+                row[f"pair_dedupe_recall@{k}"] = bk.get("stage_recall")
+
+        for alert_key, prefix in (
+            ("by_alert_rule", "alert_rule"),
+            ("by_alert_pred_stage", "alert_pred"),
+        ):
+            blk = data.get(alert_key) or {}
+            if isinstance(blk, dict) and blk.get("available") is not False and "stage_recall" in blk:
+                row[f"{prefix}_stage_recall"] = blk.get("stage_recall")
+                row[f"{prefix}_stage_precision"] = blk.get("stage_precision")
+                row[f"{prefix}_ordered_lcs"] = blk.get("ordered_stage_recall_lcs")
+                row[f"{prefix}_num_alerts"] = blk.get("num_alerts")
         rows_out.append(row)
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)

@@ -248,6 +248,159 @@ def parse_filetop_row(row: Mapping[str, Any]) -> List[Event]:
     return events
 
 
+def _pkg_install_proc(pkg: str) -> EntityRef:
+    return EntityRef(NodeType.PROC, f"{pkg}::install")
+
+
+def parse_install_row(row: Mapping[str, Any]) -> List[Event]:
+    """
+    Parse one row from QUT Install Traces (dependency aggregates) into Events.
+
+    Produces LOAD: PKG -> PROC with dependency counts in edge attrs.
+    """
+    pkg = str(row.get("Package_Name", "")).strip()
+    if not pkg:
+        return []
+
+    pkg_ent = _pkg_entity(pkg)
+    proc_ent = _install_proc_entity(pkg)
+    events: List[Event] = []
+    order = 0
+
+    load_attrs = fill_defaults(
+        canonical_edge_attrs(EdgeType.LOAD),
+        {
+            "entry_point": "install",
+            "count_total": safe_int(row.get("Total_Dependency") or row.get("Total_Dependencies")),
+            "count_unique": safe_int(row.get("Direct_Dependencies")),
+            "count_paths": safe_int(row.get("Indirect_Dependencies")),
+        },
+    )
+    events.append(
+        Event(
+            edge_type=EdgeType.LOAD,
+            src=pkg_ent,
+            dst=proc_ent,
+            order=order,
+            edge_attrs=load_attrs,
+            raw=dict(row),
+        )
+    )
+    return events
+
+
+def parse_tcp_row(row: Mapping[str, Any]) -> List[Event]:
+    """
+    Parse one row from QUT TCP Traces into Events.
+
+    Produces LOAD + CONNECT: PROC -> NET buckets for local/remote activity counts.
+    """
+    pkg = str(row.get("Package_Name", "")).strip()
+    if not pkg:
+        return []
+
+    pkg_ent = _pkg_entity(pkg)
+    proc_ent = _install_proc_entity(pkg)
+    events: List[Event] = []
+    order = 0
+
+    events.append(
+        Event(
+            edge_type=EdgeType.LOAD,
+            src=pkg_ent,
+            dst=proc_ent,
+            order=order,
+            edge_attrs=fill_defaults(canonical_edge_attrs(EdgeType.LOAD), {"entry_point": "install"}),
+            raw=dict(row),
+        )
+    )
+    order += 1
+
+    buckets = {
+        "LOCAL": safe_int(row.get("Local_IPs_Access")),
+        "REMOTE": safe_int(row.get("Remote_IPs_Access")),
+        "LOCAL_PORT": safe_int(row.get("Local_Port_Access")),
+        "REMOTE_PORT": safe_int(row.get("Remote_Port_Access")),
+    }
+    for bucket, cnt in buckets.items():
+        if cnt <= 0:
+            continue
+        net_ent = EntityRef(NodeType.NET, f"{pkg}::tcp::{bucket}")
+        conn_attrs = fill_defaults(
+            canonical_edge_attrs(EdgeType.CONNECT),
+            {
+                "bytes_sent": cnt,
+                "direction": "out" if "REMOTE" in bucket else "in",
+                "service": bucket.lower(),
+            },
+        )
+        events.append(
+            Event(
+                edge_type=EdgeType.CONNECT,
+                src=proc_ent,
+                dst=net_ent,
+                order=order,
+                edge_attrs=conn_attrs,
+                raw={"package": pkg, "bucket": bucket, "count": cnt},
+            )
+        )
+        order += 1
+
+    return events
+
+
+def parse_pattern_row(row: Mapping[str, Any]) -> List[Event]:
+    """
+    Parse one row from QUT Pattern Traces into Events.
+
+    Produces LOAD + INVOKE: PROC -> SYSCALL for each Pattern_i with positive count.
+    """
+    pkg = str(row.get("Package_Name", "")).strip()
+    if not pkg:
+        return []
+
+    pkg_ent = _pkg_entity(pkg)
+    proc_ent = _install_proc_entity(pkg)
+    events: List[Event] = []
+    order = 0
+
+    events.append(
+        Event(
+            edge_type=EdgeType.LOAD,
+            src=pkg_ent,
+            dst=proc_ent,
+            order=order,
+            edge_attrs=fill_defaults(canonical_edge_attrs(EdgeType.LOAD), {"entry_point": "install"}),
+            raw=dict(row),
+        )
+    )
+    order += 1
+
+    for i in range(1, 11):
+        col = f"Pattern_{i}"
+        cnt = safe_int(row.get(col))
+        if cnt <= 0:
+            continue
+        dst = EntityRef(NodeType.SYSCALL, f"pattern_{i}")
+        invoke_attrs = fill_defaults(
+            canonical_edge_attrs(EdgeType.INVOKE),
+            {"args": "", "return_val": 0, "count_total": cnt, "count_unique": cnt},
+        )
+        events.append(
+            Event(
+                edge_type=EdgeType.INVOKE,
+                src=proc_ent,
+                dst=dst,
+                order=order,
+                edge_attrs=invoke_attrs,
+                raw={"package": pkg, "pattern": col, "count": cnt},
+            )
+        )
+        order += 1
+
+    return events
+
+
 def parse_qut_processed_csv(path: str, kind: str) -> List[Event]:
     """
     Convenience loader: read a processed QUT CSV and parse all rows.
@@ -257,6 +410,9 @@ def parse_qut_processed_csv(path: str, kind: str) -> List[Event]:
         "syscall_traces": parse_syscall_row,
         "opensnoop_traces": parse_opensnoop_row,
         "filetop_traces": parse_filetop_row,
+        "install_traces": parse_install_row,
+        "tcp_traces": parse_tcp_row,
+        "pattern_traces": parse_pattern_row,
     }
     if kind not in parsers:
         raise ValueError(f"Unknown QUT processed kind: {kind}")

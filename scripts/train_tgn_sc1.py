@@ -50,12 +50,12 @@ def _ensure_stream(tgn_path: Path, full_path: Path) -> Dict[str, "torch.Tensor"]
     if not full_path.exists():
         raise SystemExit(
             f"Missing both `{tgn_path}` and `{full_path}`. Run:\n"
-            f"  python scripts/generate_graph.py --dataset synthchain --scenario sc1 --export-tgn\n"
+            f"  python -m gchain.pipeline --dataset synthchain --scenario sc1 --export-tgn\n"
         )
 
     blob = torch.load(full_path, weights_only=False)
     data = blob["data"]
-    from graph import hetero_to_tgn_event_stream
+    from graphcore import hetero_to_tgn_event_stream
 
     stream = hetero_to_tgn_event_stream(data, cat_hash_buckets=8, include_meta=False)
     tgn_path.parent.mkdir(parents=True, exist_ok=True)

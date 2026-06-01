@@ -23,7 +23,7 @@ class TestTGNExport(unittest.TestCase):
         )
         data = obj["data"]
 
-        from graph import hetero_to_tgn_event_stream
+        from graphcore import hetero_to_tgn_event_stream
 
         stream = hetero_to_tgn_event_stream(data, cat_hash_buckets=8, include_meta=False)
         self.assertEqual(stream.src.ndim, 1)

@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from typing import TYPE_CHECKING
 
 from config.ontology import EdgeType, NodeType, edge_triplet
-from graph.edge_meta import edge_attrs_for_export
+from graphcore.edge_meta import edge_attrs_for_export
 from parsers.events import Event
 
 if TYPE_CHECKING:  # pragma: no cover

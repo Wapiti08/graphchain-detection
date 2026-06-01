@@ -6,10 +6,10 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from graph.alert_eval import tail_alert_metrics
-from graph.attack_reconstruct import IDX_TO_STAGE, ioc_type_to_stage_idx, load_ioc_type_to_stage
-from graph.tgn_train.eval_io import write_eval_rows_csv
-from graph.tgn_train.metrics import (
+from gchain.eval.alert_eval import tail_alert_metrics
+from gchain.eval.attack_reconstruct import IDX_TO_STAGE, ioc_type_to_stage_idx, load_ioc_type_to_stage
+from gchain.train.eval_io import write_eval_rows_csv
+from gchain.train.metrics import (
     parse_topk,
     pr_auc,
     resolve_p_at_k,
@@ -18,9 +18,10 @@ from graph.tgn_train.metrics import (
     selection_score,
     topk_ioc_hits,
 )
-from graph.tgn_train.modeling import build_models, build_stage_labels
-from graph.tgn_train.neg_sampling import build_neg_pools, build_time_pools, inbatch_neg_dst, sample_window_neg_dst
-from graph.tgn_train.streams import Stream, ensure_scenario_stream, load_stream_from_tgn_pt, num_nodes_in_stream, offset_stream_nodes, regenerate_scenario_stream
+from gchain.train.modeling import build_models, build_stage_labels
+from gchain.train.neg_sampling import build_neg_pools, build_time_pools, inbatch_neg_dst, sample_window_neg_dst
+from gchain.train.split import time_split_idx
+from gchain.train.streams import Stream, ensure_scenario_stream, load_stream_from_tgn_pt, num_nodes_in_stream, offset_stream_nodes, regenerate_scenario_stream
 
 
 def _parse_scenarios(s: str) -> List[str]:
@@ -32,14 +33,14 @@ def _parse_scenarios(s: str) -> List[str]:
     return out
 
 
-def _time_split_idx(num_events: int, train_frac: float) -> int:
-    if num_events <= 1:
-        return 0
-    k = int(math.floor(float(train_frac) * float(num_events)))
-    return max(1, min(num_events - 1, k))
-
-
-def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
+def train(
+    args: "object",
+    *,
+    repo_root: Optional[Path] = None,
+    streams_override: Optional[Dict[str, Stream]] = None,
+    eval_protocol: Optional[str] = None,
+    run_meta: Optional[Dict[str, object]] = None,
+) -> None:
     if repo_root is None:
         repo_root = Path(__file__).resolve().parents[2]
 
@@ -49,48 +50,59 @@ def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
     import torch
     import torch.nn.functional as F
 
-    from graph.attack_reconstruct import NUM_STAGE_CLASSES
+    from gchain.eval.attack_reconstruct import NUM_STAGE_CLASSES
 
     torch.manual_seed(int(args.seed))
     device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
 
-    graphs_dir = (repo_root / args.graphs_dir).resolve()
-    graphs_dir.mkdir(parents=True, exist_ok=True)
+    use_aux_supervision = str(args.aux_supervision) != "off"
 
-    scenario_universe = _parse_scenarios(args.scenarios)
-    if not scenario_universe:
-        raise SystemExit("--scenarios is empty")
+    if streams_override is not None:
+        streams = dict(streams_override)
+        scenario_universe = sorted(streams.keys())
+        if not scenario_universe:
+            raise SystemExit("streams_override is empty")
+        train_scenarios = list(scenario_universe)
+        test_scenarios = list(scenario_universe)
+        train_scenarios_set = set(train_scenarios)
+        protocol = str(eval_protocol or "single_tgnpt")
+        graphs_dir = (repo_root / getattr(args, "graphs_dir", "artifacts/graphs")).resolve()
+    else:
+        graphs_dir = (repo_root / args.graphs_dir).resolve()
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+
+        scenario_universe = _parse_scenarios(args.scenarios)
+        if not scenario_universe:
+            raise SystemExit("--scenarios is empty")
+
+        if args.holdout:
+            holdout = args.holdout.strip()
+            train_scenarios = [s for s in scenario_universe if s != holdout]
+            test_scenarios = [holdout]
+        else:
+            train_scenarios = list(scenario_universe)
+            test_scenarios = list(scenario_universe)
+        train_scenarios_set = set(train_scenarios)
+
+        if args.holdout:
+            protocol = "loso_holdout"
+        elif len(test_scenarios) == 1 and set(train_scenarios) == {test_scenarios[0]}:
+            protocol = "per_scenario"
+        else:
+            protocol = "joint_multi"
+
+        streams = {}
+        for sc in sorted(set(train_scenarios + test_scenarios)):
+            _, st = ensure_scenario_stream(
+                repo_root=repo_root,
+                graphs_dir=graphs_dir,
+                scenario=sc,
+                auto_generate=bool(args.auto_generate),
+            )
+            streams[sc] = st
 
     if int(args.early_stop_patience) > 0 and not bool(args.eval_ioc):
         print("warning: --early-stop-patience is ignored without --eval-ioc.", flush=True)
-
-    if args.holdout:
-        holdout = args.holdout.strip()
-        train_scenarios = [s for s in scenario_universe if s != holdout]
-        test_scenarios = [holdout]
-    else:
-        train_scenarios = list(scenario_universe)
-        test_scenarios = list(scenario_universe)
-    train_scenarios_set = set(train_scenarios)
-
-    if args.holdout:
-        eval_protocol = "loso_holdout"
-    elif len(test_scenarios) == 1 and set(train_scenarios) == {test_scenarios[0]}:
-        eval_protocol = "per_scenario"
-    else:
-        eval_protocol = "joint_multi"
-
-    use_aux_supervision = str(args.aux_supervision) != "off"
-
-    streams: Dict[str, Stream] = {}
-    for sc in sorted(set(train_scenarios + test_scenarios)):
-        _, st = ensure_scenario_stream(
-            repo_root=repo_root,
-            graphs_dir=graphs_dir,
-            scenario=sc,
-            auto_generate=bool(args.auto_generate),
-        )
-        streams[sc] = st
 
     msg_dims = {sc: int(streams[sc].msg.size(-1)) for sc in streams}
     uniq_dims = sorted(set(msg_dims.values()))
@@ -186,7 +198,7 @@ def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
         source_file = getattr(st, "source_file", None)
         ioc_type = getattr(st, "ioc_type", None)
 
-        split_idx = _time_split_idx(int(src.numel()), float(args.train_frac))
+        split_idx = time_split_idx(int(src.numel()), float(args.train_frac))
         if score_all:
             lo, hi = (0, int(src.numel()))
         else:
@@ -438,7 +450,12 @@ def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
     best_epoch: Optional[int] = None
     best_auroc_at_best: float = float("nan")
     best_auprc_at_best: float = float("nan")
-    best_ckpt_path = out_dir / ("best_ckpt_holdout.pt" if args.holdout else "best_ckpt_joint.pt")
+    if protocol == "single_tgnpt":
+        best_ckpt_path = out_dir / "best_ckpt.pt"
+        final_ckpt_name = "ckpt.pt"
+    else:
+        best_ckpt_path = out_dir / ("best_ckpt_holdout.pt" if args.holdout else "best_ckpt_joint.pt")
+        final_ckpt_name = "ckpt_holdout.pt" if args.holdout else "ckpt_joint.pt"
     best_scores_path = out_dir / "best_eval_tail_scores.csv"
     best_scores_all_path = out_dir / "best_eval_all_scores.csv"
 
@@ -613,7 +630,7 @@ def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
     }
     if stage_pred is not None:
         final_ckpt["stage_pred"] = stage_pred.state_dict()
-    torch.save(final_ckpt, out_dir / ("ckpt_holdout.pt" if args.holdout else "ckpt_joint.pt"))
+    torch.save(final_ckpt, out_dir / final_ckpt_name)
 
     if best_epoch is not None:
         print(f"Best by {metric_label}: epoch {best_epoch} = {best_metric:.4f}")
@@ -631,7 +648,7 @@ def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
 
     primary_scenario = str(args.holdout).strip() if args.holdout else (test_scenarios[0] if len(test_scenarios) == 1 else "")
     summary = {
-        "eval_protocol": eval_protocol,
+        "eval_protocol": protocol,
         "scenario": primary_scenario,
         "holdout": str(args.holdout) if args.holdout else "",
         "scenarios": list(scenario_universe),
@@ -662,6 +679,9 @@ def train(args: "object", *, repo_root: Optional[Path] = None) -> None:
         "last_tail_eval": {k: _jf(v) for k, v in last_tail_eval.items()},
         "best_tail_eval": {k: _jf(v) for k, v in best_tail_eval.items()},
     }
+    summary["input_mode"] = str((run_meta or {}).get("input_mode", "synthchain"))
+    if run_meta:
+        summary.update({k: v for k, v in run_meta.items()})
     (out_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"Saved: {out_dir}")
 

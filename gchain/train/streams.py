@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, TYPE_CHECKING
@@ -84,42 +81,33 @@ def ensure_scenario_stream(
     if not auto_generate:
         raise SystemExit(
             f"Missing `{tgn_path}`. Generate it via:\n"
-            f"  python scripts/generate_graph.py --dataset synthchain --scenario {scenario} --export-tgn\n"
+            f"  python -m gchain.pipeline --dataset synthchain --scenario {scenario} --export-tgn\n"
         )
 
-    env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "")
-    cmd = [
-        sys.executable,
-        str(repo_root / "scripts" / "generate_graph.py"),
-        "--dataset",
-        "synthchain",
-        "--scenario",
-        scenario,
-        "--export-tgn",
-        "--out",
-        str(graphs_dir.relative_to(repo_root)),
-    ]
-    subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
+    from gchain.pipeline import generate_graph
 
-    if not tgn_path.exists():
+    result = generate_graph(
+        repo_root=repo_root,
+        dataset="synthchain",
+        scenario=scenario,
+        out=str(graphs_dir.relative_to(repo_root)),
+        export_tgn=True,
+        verbose=False,
+    )
+    if result.tgn_pt is None or not result.tgn_pt.exists():
         raise SystemExit(f"Auto-generation finished but `{tgn_path}` was not created.")
     return tgn_path, load_stream_from_tgn_pt(tgn_path)
 
 
 def regenerate_scenario_stream(*, repo_root: Path, graphs_dir: Path, scenario: str) -> None:
-    env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "")
-    cmd = [
-        sys.executable,
-        str(repo_root / "scripts" / "generate_graph.py"),
-        "--dataset",
-        "synthchain",
-        "--scenario",
-        scenario,
-        "--export-tgn",
-        "--out",
-        str(graphs_dir.relative_to(repo_root)),
-    ]
-    subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
+    from gchain.pipeline import generate_graph
+
+    generate_graph(
+        repo_root=repo_root,
+        dataset="synthchain",
+        scenario=scenario,
+        out=str(graphs_dir.relative_to(repo_root)),
+        export_tgn=True,
+        verbose=False,
+    )
 

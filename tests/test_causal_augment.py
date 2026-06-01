@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from graph.augment import augment_events_with_causal
+from graphcore.augment import augment_events_with_causal
 from parsers.qut.processed import parse_syscall_row
 
 

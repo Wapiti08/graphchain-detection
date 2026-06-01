@@ -10,8 +10,10 @@
 #   EXTRA_TRAIN_ARGS='--aux-supervision off' bash scripts/run_per_scenario_eval.sh
 #   # With weak stage supervision (shared ioc_type->stage ontology):
 #   EXTRA_TRAIN_ARGS='--lambda-stage 0.5 --lambda-ioc-rank 0.1' bash scripts/run_per_scenario_eval.sh
-#   # Also run attack reconstruction eval after each fold:
-#   RUN_RECON=1 bash scripts/run_per_scenario_eval.sh
+#   # Also run attack reconstruction (uses best_eval_all_scores.csv when present):
+#   RUN_RECON=1 SAVE_SCORES_SPLIT=all bash scripts/run_per_scenario_eval.sh
+#   # Or one scenario, same protocol as sc1/sc2:
+#   bash scripts/run_per_scenario_ssl_recon.sh sc3
 #
 set -euo pipefail
 
@@ -52,17 +54,29 @@ for SC in sc1 sc2 sc3 sc4 sc5 sc6 sc7; do
     --eval-ioc \
     --aux-supervision train_only \
     --select-metric "${SELECT_METRIC}" \
+    --save-scores \
+    --save-scores-split "${SAVE_SCORES_SPLIT:-tail}" \
     --out "${OUT}" \
     ${EXTRA_TRAIN_ARGS}
 
   if [[ "${RUN_RECON}" == "1" ]]; then
     GT="${STAGE_GT_DIR}/${SC}.stages_gt.json"
-    SCORES="${OUT}/best_eval_tail_scores.csv"
+    SCORES="${OUT}/best_eval_all_scores.csv"
+    if [[ ! -f "${SCORES}" ]]; then
+      SCORES="${OUT}/eval_all_scores.csv"
+    fi
+    if [[ ! -f "${SCORES}" ]]; then
+      SCORES="${OUT}/best_eval_tail_scores.csv"
+    fi
     if [[ -f "${SCORES}" && -f "${GT}" ]]; then
-      echo "========== reconstruction ${SC}"
+      echo "========== reconstruction ${SC} (${SCORES})"
       "${PY}" scripts/eval_attack_reconstruction.py \
         --scores-csv "${SCORES}" \
-        --stage-gt "${GT}"
+        --stage-gt "${GT}" \
+        --topks "${RECON_TOPKS:-10,50,100,500}" \
+        --pred-min-prob "${RECON_PRED_MIN_PROB:-0.5}" \
+        --pred-min-count "${RECON_PRED_MIN_COUNT:-2}" \
+        --out "${OUT}/reconstruction_metrics.json"
     else
       echo "run_per_scenario_eval: skip recon ${SC} (missing scores or ${GT})" >&2
     fi

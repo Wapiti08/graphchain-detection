@@ -1,6 +1,17 @@
 # GraphChain-Detection
 detection of ongoing supply chain vulnerabilities with temporal graph neural networks
 
+## Python packages
+
+| Package | Role |
+|---------|------|
+| `parsers/` | Raw logs / CSV → canonical `Event` |
+| `config/` | Ontology, dataset paths |
+| `graphcore/` | Hetero graph build + TGN stream export (`build_hetero_graph`, `hetero_to_tgn_event_stream`) |
+| `gchain/` | Pipeline (`gchain.pipeline`), TGN training (`gchain.train`), detection metrics (`gchain.eval`) |
+
+CLI: `python -m gchain.pipeline`, `python -m gchain.train` (or `scripts/train_tgn.py`).
+
 ## Data Processing (Feature Extraction)
 
 ### Unified Entity Ontology
@@ -113,10 +124,19 @@ The canonical graph schema is based on HetHunt's heterogeneous runtime graph and
 
 ## Quick Running
 ```
-python scripts/generate_graph.py --dataset synthchain --scenario sc1
+python -m gchain.pipeline --dataset synthchain --scenario sc1
 
 # (recommended) export flattened TGN event stream
-python scripts/generate_graph.py --dataset synthchain --scenario sc1 --export-tgn
+python -m gchain.pipeline --dataset synthchain --scenario sc1 --export-tgn
+
+# QUT joined package (six trace tables: install/syscall/opensnoop/filetop/tcp/pattern)
+python -m gchain.pipeline --dataset qut --qut-kind all --package-name cracker --export-tgn
+
+# QUT: batch-export all packages' .tgn.pt (loads six CSVs once; ~14k packages — use --max-packages for smoke)
+python -m gchain.pipeline --dataset qut --qut-kind all --all-packages --export-tgn --skip-existing
+
+# SynthChain: batch-export sc1..sc7 .tgn.pt
+python -m gchain.pipeline --dataset synthchain --all-scenarios --export-tgn
 
 # train/validate on sc1 with strict time split (past -> future)
 python scripts/train_tgn_sc1.py --epochs 5 --batch-size 256
@@ -141,7 +161,7 @@ bash scripts/run_loso_synthchain.sh
 # Optional: shallow IOC supervision (margin on anomaly score vs non-IOC in same batch)
 # python scripts/train_tgn_synthchain.py --holdout sc3 --eval-ioc --warmup --lambda-ioc-rank 0.1 --ioc-rank-margin 0.5 ...
 
-# aggregate_alerts shares graph/alert_eval.py with train metrics (pf / ar / fr / p@K in epoch logs)
+# aggregate_alerts shares gchain.eval.alert_eval with train metrics (pf / ar / fr / p@K in epoch logs)
 python scripts/aggregate_alerts.py --scores-csv artifacts/tgn_runs/synthchain_multi/best_eval_tail_scores.csv --out-dir artifacts/alerts
 
 # full pipeline smoke: pytest + sc1 graph/TGN + 1-epoch train + tail scores + aggregate
