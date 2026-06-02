@@ -74,6 +74,69 @@ def main() -> None:
         help="Skip by_k_pair_dedupe (max score per scenario,etype,src,dst then top-K).",
     )
     p.add_argument(
+        "--source-file-quota",
+        type=str,
+        default="",
+        help="Enable by_k_source_quota: comma-separated 'source_file=N' items, e.g. 'zeek_conn.csv=20,zeek_http.csv=10'.",
+    )
+    p.add_argument(
+        "--source-quota-exclude-etypes",
+        type=str,
+        default="",
+        help="For by_k_source_quota: comma-separated etype ids to exclude (e.g. 2 to drop DEPEND).",
+    )
+    p.add_argument(
+        "--source-quota-no-pair-dedupe",
+        action="store_true",
+        help="For by_k_source_quota: do not pre-dedupe by (etype,src,dst).",
+    )
+    p.add_argument(
+        "--group-cap-key",
+        type=str,
+        default="",
+        help="Enable by_k_group_cap: group key in {etype_dst,etype_src,etype_dst_port,etype_src_port}.",
+    )
+    p.add_argument(
+        "--group-cap-max",
+        type=int,
+        default=0,
+        help="For by_k_group_cap: maximum edges per group (0 disables).",
+    )
+    p.add_argument(
+        "--group-cap-no-pair-dedupe",
+        action="store_true",
+        help="For by_k_group_cap: do not pre-dedupe by (etype,src,dst).",
+    )
+    p.add_argument(
+        "--group-cap-adaptive-key",
+        type=str,
+        default="",
+        help="Enable by_k_group_cap_adaptive: group key in {etype_dst,etype_src,etype_dst_port,etype_src_port}.",
+    )
+    p.add_argument(
+        "--group-cap-adaptive-probe-mult",
+        type=int,
+        default=5,
+        help="For by_k_group_cap_adaptive: probe head multiplier (K' = probe_mult * K).",
+    )
+    p.add_argument(
+        "--group-cap-adaptive-hot-threshold",
+        type=int,
+        default=20,
+        help="For by_k_group_cap_adaptive: groups with >= threshold occurrences in probe head are capped.",
+    )
+    p.add_argument(
+        "--group-cap-adaptive-hot-cap",
+        type=int,
+        default=10,
+        help="For by_k_group_cap_adaptive: cap for hot groups (0 disables).",
+    )
+    p.add_argument(
+        "--group-cap-adaptive-no-pair-dedupe",
+        action="store_true",
+        help="For by_k_group_cap_adaptive: do not pre-dedupe by (etype,src,dst).",
+    )
+    p.add_argument(
         "--no-alert-reconstruction",
         action="store_true",
         help="Skip by_alert_rule / by_alert_pred_stage metrics.",
@@ -128,6 +191,23 @@ def main() -> None:
             if allowed:
                 ioc_log_files = allowed
 
+    quota: Dict[str, int] = {}
+    if str(args.source_file_quota).strip():
+        for item in str(args.source_file_quota).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            k = k.strip()
+            try:
+                vv = int(v.strip())
+            except Exception:
+                continue
+            if k and vv > 0:
+                quota[k] = vv
+
     metrics = evaluate_reconstruction(
         rows=rows,
         stages_gt=stages_gt,
@@ -144,6 +224,19 @@ def main() -> None:
         alert_min_events=int(args.alert_min_events),
         alert_topk_events=int(args.alert_topk_events),
         alert_dedupe=not bool(args.no_alert_dedupe),
+        source_file_min_quota=quota if quota else None,
+        source_quota_exclude_etypes=set(int(x.strip()) for x in str(args.source_quota_exclude_etypes).split(",") if x.strip())
+        if str(args.source_quota_exclude_etypes).strip()
+        else None,
+        source_quota_pair_dedupe=not bool(args.source_quota_no_pair_dedupe),
+        group_cap_key=str(args.group_cap_key or "").strip(),
+        group_cap_max=int(args.group_cap_max),
+        group_cap_pair_dedupe=not bool(args.group_cap_no_pair_dedupe),
+        group_cap_adaptive_key=str(args.group_cap_adaptive_key or "").strip(),
+        group_cap_adaptive_probe_mult=int(args.group_cap_adaptive_probe_mult),
+        group_cap_adaptive_hot_threshold=int(args.group_cap_adaptive_hot_threshold),
+        group_cap_adaptive_hot_cap=int(args.group_cap_adaptive_hot_cap),
+        group_cap_adaptive_pair_dedupe=not bool(args.group_cap_adaptive_no_pair_dedupe),
     )
     metrics["scenario"] = scenario
     metrics["scores_csv"] = str(scores_csv)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
@@ -33,6 +34,8 @@ def load_synthchain_events(
     only_ioc_logs: bool = True,
     limit_per_file: Optional[int] = None,
     ioc_ground_truth_path: str | Path | None = "data/SynthChain/iocs/ioc_ground_truth.json",
+    *,
+    verbose: bool = False,
 ) -> List[Event]:
     """
     Load and parse SynthChain logs for a scenario based on SYNTHCHAIN_IOC_CONFIG.
@@ -46,6 +49,13 @@ def load_synthchain_events(
     cfg = SYNTHCHAIN_IOC_CONFIG[scenario_id]
     base = Path(project_root) / cfg["root"]
     out: List[Event] = []
+
+    debug = bool(verbose) or str(os.environ.get("SYNTHCHAIN_DEBUG_LOAD") or "").strip() in {"1", "true", "yes", "y"}
+    if debug:
+        print(
+            f"[load_synthchain_events] scenario={scenario_id} base={base} "
+            f"only_ioc_logs={only_ioc_logs} limit_per_file={limit_per_file}"
+        )
 
     for log_name, spec in cfg["logs"].items():
         if only_ioc_logs and not spec.get("has_ioc", False):
@@ -75,30 +85,53 @@ def load_synthchain_events(
             if limit_per_file is not None:
                 df = df.head(limit_per_file)
 
+            if debug:
+                print(f"[load_synthchain_events] parse csv log={log_name} file={gt_source_file} rows={len(df)}")
+
             if log_name == "azure_conn":
-                out.extend(parse_azure_conn_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_azure_conn_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "azure_process":
-                out.extend(parse_azure_process_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_azure_process_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "azure_events":
-                out.extend(parse_azure_events_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_azure_events_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "azure_syslog":
-                out.extend(parse_azure_syslog_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_azure_syslog_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "zeek_conn":
-                out.extend(parse_zeek_conn_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_zeek_conn_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "zeek_dns":
-                out.extend(parse_zeek_dns_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_zeek_dns_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "zeek_http":
-                out.extend(parse_zeek_http_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_zeek_http_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "zeek_files":
-                out.extend(parse_zeek_files_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_zeek_files_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             elif log_name == "zeek_ssl":
-                out.extend(parse_zeek_ssl_df(df, scenario_id, source_file=gt_source_file))
+                evs = parse_zeek_ssl_df(df, scenario_id, source_file=gt_source_file)
+                out.extend(evs)
             else:
                 # unknown csv type, ignore for now
                 continue
 
+            if debug:
+                print(
+                    f"[load_synthchain_events] -> events_added={len(evs)} (csv log={log_name}) "
+                    f"total_so_far={len(out)}"
+                )
+
         elif path.suffix.lower() == ".json" and path.name == "eve.json":
-            out.extend(parse_eve_json_lines(path, scenario_id, source_file=gt_source_file, limit=limit_per_file))
+            if debug:
+                print(f"[load_synthchain_events] parse eve file={gt_source_file} limit={limit_per_file}")
+            evs = parse_eve_json_lines(path, scenario_id, source_file=gt_source_file, limit=limit_per_file)
+            out.extend(evs)
+            if debug:
+                print(f"[load_synthchain_events] -> events_added={len(evs)} (eve) total_so_far={len(out)}")
 
     # IOC annotation (optional)
     if ioc_ground_truth_path is not None:
@@ -107,7 +140,14 @@ def load_synthchain_events(
             idx_by_scenario = load_ioc_ground_truth(gt_path)
             idx = idx_by_scenario.get(scenario_id)
             if idx is not None:
+                if debug:
+                    print(f"[load_synthchain_events] annotate_events_with_iocs input_events={len(out)}")
                 out = annotate_events_with_iocs(out, idx)
+                if debug:
+                    print(f"[load_synthchain_events] annotate_events_with_iocs output_events={len(out)}")
+
+    if debug:
+        print(f"[load_synthchain_events] total_events={len(out)}")
 
     return out
 
@@ -171,11 +211,16 @@ def annotate_events_with_iocs(events: List[Event], idx: IOCIndex, *, max_values:
     values = idx.values
     types_by_value = idx.types_by_value
     hits_by_file_line = idx.hits_by_file_line
+    debug = str(os.environ.get("SYNTHCHAIN_DEBUG_LOAD") or "").strip() in {"1", "true", "yes", "y"}
+    n_in = len(events)
+    n_proc = 0
 
     for ev in events:
+        n_proc += 1
         # 1) line-level match (preferred when available)
         src_file = str(ev.raw.get("source_file") or "")
         row_idx = ev.raw.get("row_idx")
+        line_hit = False
         if src_file and isinstance(row_idx, int):
             file_map = hits_by_file_line.get(src_file)
             if file_map:
@@ -191,10 +236,13 @@ def annotate_events_with_iocs(events: List[Event], idx: IOCIndex, *, max_values:
                         ea["ioc_values"] = hits
                         ea["ioc_types"] = hit_types
                         out.append(replace(ev, edge_attrs=ea))
+                        line_hit = True
                         break
                 else:
                     pass  # no line hit; fallback to value match
-                if out and out[-1] is not ev and out[-1].edge_attrs.get("is_ioc_line"):
+                if line_hit:
+                    # This event already got line-level IOC annotation.
+                    # Do not run the value-level fallback, to avoid mixing sources.
                     continue
 
         # 2) value-level match (fallback)
@@ -222,6 +270,12 @@ def annotate_events_with_iocs(events: List[Event], idx: IOCIndex, *, max_values:
                 ea["is_ioc_line"] = False
             out.append(replace(ev, edge_attrs=ea))
 
+    if debug:
+        print(f"[annotate_events_with_iocs] processed={n_proc} in={n_in} out={len(out)}")
+        if n_proc != n_in or len(out) != n_in:
+            raise RuntimeError(
+                f"annotate_events_with_iocs length mismatch: processed={n_proc} in={n_in} out={len(out)}"
+            )
     return out
 
 

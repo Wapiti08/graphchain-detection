@@ -1,7 +1,7 @@
 """Top-K edge ranking and stage collection for chain reconstruction."""
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from gchain.eval.alert_eval import dedupe_events, rows_to_events
 from gchain.eval.recon_stages import (
@@ -105,6 +105,412 @@ def topk_ioc_edges(
 ) -> List[Dict[str, Any]]:
     ioc_rows = [dict(r) for r in rows if int(r.get("is_ioc", 0)) == 1]
     return topk_edges(ioc_rows, k, endpoint_pair_dedupe=endpoint_pair_dedupe)
+
+
+def select_topk_source_quota(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    k: int,
+    source_file_min_quota: Mapping[str, int],
+    endpoint_pair_dedupe: bool = True,
+    exclude_etypes: Optional[Set[int]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Select top-K edges with per-source_file minimum quotas (eval-only).
+
+    Algorithm:
+    - Build a score-desc pool (optionally pair-deduped).
+    - Optionally exclude certain etype ids.
+    - First, satisfy each source_file's quota using its highest-score edges.
+    - Then, fill remaining slots by global score desc.
+    """
+    kk = max(0, int(k))
+    quotas: Dict[str, int] = {}
+    for sf, n in dict(source_file_min_quota or {}).items():
+        sf2 = str(sf).strip()
+        nn = int(n)
+        if sf2 and nn > 0:
+            quotas[sf2] = nn
+    ex = set(int(x) for x in (exclude_etypes or set()))
+
+    if endpoint_pair_dedupe:
+        pool, pool_meta = dedupe_rows_by_endpoint_pair(rows)
+        pool.sort(key=lambda r: float(r["score"]), reverse=True)
+    else:
+        pool = sorted([dict(r) for r in rows], key=lambda r: float(r["score"]), reverse=True)
+        pool_meta = {"n_input_rows": int(len(rows)), "n_pair_deduped_rows": None, "n_collapsed_rows": None}
+
+    # Apply etype exclusion up front.
+    if ex:
+        pool2: List[Dict[str, Any]] = []
+        for r in pool:
+            try:
+                if int(r.get("etype")) in ex:
+                    continue
+            except Exception:
+                continue
+            pool2.append(r)
+        pool = pool2
+
+    selected: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[str, int, int, int, int]] = set()
+
+    def _key(r: Mapping[str, Any]) -> Tuple[str, int, int, int, int]:
+        return (
+            str(r.get("scenario")),
+            int(float(r.get("t", 0))),
+            int(r.get("etype", 0)),
+            int(r.get("src", 0)),
+            int(r.get("dst", 0)),
+        )
+
+    per_source_selected: Dict[str, int] = {sf: 0 for sf in quotas}
+
+    # Pass 1: satisfy per-source quotas.
+    for sf, need in quotas.items():
+        if len(selected) >= kk:
+            break
+        got = 0
+        for r in pool:
+            if len(selected) >= kk or got >= need:
+                break
+            if str(r.get("source_file") or "").strip() != sf:
+                continue
+            try:
+                k2 = _key(r)
+            except Exception:
+                continue
+            if k2 in seen_keys:
+                continue
+            selected.append(dict(r))
+            seen_keys.add(k2)
+            got += 1
+        per_source_selected[sf] = got
+
+    # Pass 2: fill remaining by global score.
+    for r in pool:
+        if len(selected) >= kk:
+            break
+        try:
+            k2 = _key(r)
+        except Exception:
+            continue
+        if k2 in seen_keys:
+            continue
+        selected.append(dict(r))
+        seen_keys.add(k2)
+
+    meta = {
+        **pool_meta,
+        "k": int(kk),
+        "endpoint_pair_dedupe": bool(endpoint_pair_dedupe),
+        "exclude_etypes": sorted(ex),
+        "source_file_min_quota": {k: int(v) for k, v in sorted(quotas.items())},
+        "source_file_selected": {k: int(v) for k, v in sorted(per_source_selected.items())},
+        "n_selected": int(len(selected)),
+    }
+    return selected, meta
+
+
+def select_topk_group_cap(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    k: int,
+    cap_key: str = "etype_dst",
+    cap_max: int = 5,
+    endpoint_pair_dedupe: bool = True,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Select top-K edges with per-group maximum counts (eval-only).
+
+    This is a softer alternative to strict pair dedupe: it reduces "hub" patterns dominating
+    top-K, while still allowing multiple edges per group.
+
+    Supported cap_key:
+      - "etype_dst": group by (etype, dst)
+      - "etype_src": group by (etype, src)
+      - "etype_dst_port": group by (etype, dst, dst_port)
+      - "etype_src_port": group by (etype, src, src_port)
+    """
+    kk = max(0, int(k))
+    mm = max(1, int(cap_max))
+
+    if endpoint_pair_dedupe:
+        pool, pool_meta = dedupe_rows_by_endpoint_pair(rows)
+        pool.sort(key=lambda r: float(r["score"]), reverse=True)
+    else:
+        pool = sorted([dict(r) for r in rows], key=lambda r: float(r["score"]), reverse=True)
+        pool_meta = {"n_input_rows": int(len(rows)), "n_pair_deduped_rows": None, "n_collapsed_rows": None}
+
+    def _group(r: Mapping[str, Any]) -> Tuple[Any, ...]:
+        et = int(r.get("etype", 0))
+        if cap_key == "etype_dst":
+            return (et, int(r.get("dst", 0)))
+        if cap_key == "etype_src":
+            return (et, int(r.get("src", 0)))
+        if cap_key == "etype_dst_port":
+            # Prefer explicit port if present, otherwise fall back to dst key.
+            try:
+                port = int(r.get("dst_port", r.get("port", -1)))
+            except Exception:
+                port = -1
+            return (et, int(r.get("dst", 0)), port)
+        if cap_key == "etype_src_port":
+            try:
+                port = int(r.get("src_port", -1))
+            except Exception:
+                port = -1
+            return (et, int(r.get("src", 0)), port)
+        # default: etype_dst
+        return (et, int(r.get("dst", 0)))
+
+    selected: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[str, int, int, int, int]] = set()
+    group_counts: Dict[Tuple[Any, ...], int] = {}
+
+    def _key(r: Mapping[str, Any]) -> Tuple[str, int, int, int, int]:
+        return (
+            str(r.get("scenario")),
+            int(float(r.get("t", 0))),
+            int(r.get("etype", 0)),
+            int(r.get("src", 0)),
+            int(r.get("dst", 0)),
+        )
+
+    for r in pool:
+        if len(selected) >= kk:
+            break
+        try:
+            k2 = _key(r)
+        except Exception:
+            continue
+        if k2 in seen_keys:
+            continue
+        g = _group(r)
+        if int(group_counts.get(g, 0)) >= mm:
+            continue
+        selected.append(dict(r))
+        seen_keys.add(k2)
+        group_counts[g] = int(group_counts.get(g, 0)) + 1
+
+    meta = {
+        **pool_meta,
+        "k": int(kk),
+        "endpoint_pair_dedupe": bool(endpoint_pair_dedupe),
+        "cap_key": str(cap_key),
+        "cap_max": int(mm),
+        "n_selected": int(len(selected)),
+        "n_groups": int(len(group_counts)),
+    }
+    return selected, meta
+
+
+def eval_topk_group_cap(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    obs: Set[str],
+    gt_order: List[str],
+    ioc_type_to_stage: Mapping[str, str],
+    line_to_type: Mapping[Tuple[str, int], str],
+    topks: Sequence[int],
+    cap_key: str,
+    cap_max: int,
+    endpoint_pair_dedupe: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    out: Dict[str, Any] = {}
+    last_meta: Dict[str, Any] = {}
+    for k in topks:
+        selected, meta = select_topk_group_cap(
+            rows,
+            k=int(k),
+            cap_key=str(cap_key),
+            cap_max=int(cap_max),
+            endpoint_pair_dedupe=bool(endpoint_pair_dedupe),
+        )
+        last_meta = meta
+        counts: Dict[str, int] = {}
+        for r in selected:
+            if int(r.get("is_ioc", 0)) != 1:
+                continue
+            st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
+            if st:
+                counts[st] = counts.get(st, 0) + 1
+        pred = set(counts.keys())
+        pred_order = ordered_stage_sequence(pred)
+        inter = pred & obs
+        recall = float(len(inter)) / float(max(1, len(obs)))
+        precision = float(len(inter)) / float(max(1, len(pred))) if pred else 0.0
+        lcs_val = lcs_length(pred_order, gt_order)
+        out[str(int(k))] = {
+            "predicted_stages": sorted(pred),
+            "stage_recall": recall,
+            "stage_precision": precision,
+            "ordered_stage_recall_lcs": float(lcs_val) / float(max(1, len(gt_order))),
+            "lcs_length": int(lcs_val),
+            "chain_segments": build_chain_segments(
+                selected,
+                ioc_type_to_stage=ioc_type_to_stage,
+                line_to_type=line_to_type,
+                use_predicted=False,
+                pred_min_prob=0.0,
+            ),
+        }
+    return out, last_meta
+
+
+def select_topk_group_cap_adaptive(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    k: int,
+    cap_key: str = "etype_src",
+    probe_mult: int = 5,
+    hot_threshold: int = 20,
+    hot_cap_max: int = 10,
+    endpoint_pair_dedupe: bool = True,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Adaptive per-group cap: only cap groups that dominate the high-score head.
+
+    - Probe head size K' = probe_mult * K (clipped to pool size)
+    - Mark groups with count >= hot_threshold as hot
+    - Apply cap (hot_cap_max) only to hot groups when selecting top-K
+    """
+    kk = max(0, int(k))
+    pm = max(1, int(probe_mult))
+    th = max(1, int(hot_threshold))
+    cap = max(1, int(hot_cap_max))
+
+    if endpoint_pair_dedupe:
+        pool, pool_meta = dedupe_rows_by_endpoint_pair(rows)
+        pool.sort(key=lambda r: float(r["score"]), reverse=True)
+    else:
+        pool = sorted([dict(r) for r in rows], key=lambda r: float(r["score"]), reverse=True)
+        pool_meta = {"n_input_rows": int(len(rows)), "n_pair_deduped_rows": None, "n_collapsed_rows": None}
+
+    def _group(r: Mapping[str, Any]) -> Tuple[Any, ...]:
+        et = int(r.get("etype", 0))
+        if cap_key == "etype_dst":
+            return (et, int(r.get("dst", 0)))
+        if cap_key == "etype_src":
+            return (et, int(r.get("src", 0)))
+        if cap_key == "etype_dst_port":
+            try:
+                port = int(r.get("dst_port", r.get("port", -1)))
+            except Exception:
+                port = -1
+            return (et, int(r.get("dst", 0)), port)
+        if cap_key == "etype_src_port":
+            try:
+                port = int(r.get("src_port", -1))
+            except Exception:
+                port = -1
+            return (et, int(r.get("src", 0)), port)
+        return (et, int(r.get("src", 0)))
+
+    probe_n = min(len(pool), kk * pm) if kk > 0 else 0
+    group_probe_counts: Dict[Tuple[Any, ...], int] = {}
+    for r in pool[:probe_n]:
+        g = _group(r)
+        group_probe_counts[g] = int(group_probe_counts.get(g, 0)) + 1
+    hot_groups = {g for g, c in group_probe_counts.items() if int(c) >= th}
+
+    selected: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[str, int, int, int, int]] = set()
+    hot_used: Dict[Tuple[Any, ...], int] = {}
+
+    def _key(r: Mapping[str, Any]) -> Tuple[str, int, int, int, int]:
+        return (
+            str(r.get("scenario")),
+            int(float(r.get("t", 0))),
+            int(r.get("etype", 0)),
+            int(r.get("src", 0)),
+            int(r.get("dst", 0)),
+        )
+
+    for r in pool:
+        if len(selected) >= kk:
+            break
+        try:
+            k2 = _key(r)
+        except Exception:
+            continue
+        if k2 in seen_keys:
+            continue
+        g = _group(r)
+        if g in hot_groups and int(hot_used.get(g, 0)) >= cap:
+            continue
+        selected.append(dict(r))
+        seen_keys.add(k2)
+        if g in hot_groups:
+            hot_used[g] = int(hot_used.get(g, 0)) + 1
+
+    meta = {
+        **pool_meta,
+        "k": int(kk),
+        "endpoint_pair_dedupe": bool(endpoint_pair_dedupe),
+        "cap_key": str(cap_key),
+        "probe_mult": int(pm),
+        "probe_n": int(probe_n),
+        "hot_threshold": int(th),
+        "hot_cap_max": int(cap),
+        "n_hot_groups": int(len(hot_groups)),
+        "n_selected": int(len(selected)),
+    }
+    return selected, meta
+
+
+def eval_topk_group_cap_adaptive(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    obs: Set[str],
+    gt_order: List[str],
+    ioc_type_to_stage: Mapping[str, str],
+    line_to_type: Mapping[Tuple[str, int], str],
+    topks: Sequence[int],
+    cap_key: str,
+    probe_mult: int,
+    hot_threshold: int,
+    hot_cap_max: int,
+    endpoint_pair_dedupe: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    out: Dict[str, Any] = {}
+    last_meta: Dict[str, Any] = {}
+    for k in topks:
+        selected, meta = select_topk_group_cap_adaptive(
+            rows,
+            k=int(k),
+            cap_key=str(cap_key),
+            probe_mult=int(probe_mult),
+            hot_threshold=int(hot_threshold),
+            hot_cap_max=int(hot_cap_max),
+            endpoint_pair_dedupe=bool(endpoint_pair_dedupe),
+        )
+        last_meta = meta
+        counts: Dict[str, int] = {}
+        for r in selected:
+            if int(r.get("is_ioc", 0)) != 1:
+                continue
+            st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
+            if st:
+                counts[st] = counts.get(st, 0) + 1
+        pred = set(counts.keys())
+        pred_order = ordered_stage_sequence(pred)
+        inter = pred & obs
+        recall = float(len(inter)) / float(max(1, len(obs)))
+        precision = float(len(inter)) / float(max(1, len(pred))) if pred else 0.0
+        lcs_val = lcs_length(pred_order, gt_order)
+        out[str(int(k))] = {
+            "predicted_stages": sorted(pred),
+            "stage_recall": recall,
+            "stage_precision": precision,
+            "ordered_stage_recall_lcs": float(lcs_val) / float(max(1, len(gt_order))),
+            "lcs_length": int(lcs_val),
+            "chain_segments": build_chain_segments(
+                selected,
+                ioc_type_to_stage=ioc_type_to_stage,
+                line_to_type=line_to_type,
+                use_predicted=False,
+                pred_min_prob=0.0,
+            ),
+        }
+    return out, last_meta
 
 
 def stages_from_topk(
@@ -273,3 +679,57 @@ def eval_topk_modes(
             "chain_segments": segments,
         }
     return by_k
+
+
+def eval_topk_source_quota(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    obs: Set[str],
+    gt_order: List[str],
+    ioc_type_to_stage: Mapping[str, str],
+    line_to_type: Mapping[Tuple[str, int], str],
+    topks: Sequence[int],
+    source_file_min_quota: Mapping[str, int],
+    exclude_etypes: Optional[Set[int]] = None,
+    endpoint_pair_dedupe: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    out: Dict[str, Any] = {}
+    last_meta: Dict[str, Any] = {}
+    for k in topks:
+        selected, meta = select_topk_source_quota(
+            rows,
+            k=int(k),
+            source_file_min_quota=source_file_min_quota,
+            endpoint_pair_dedupe=bool(endpoint_pair_dedupe),
+            exclude_etypes=exclude_etypes,
+        )
+        last_meta = meta
+
+        counts: Dict[str, int] = {}
+        for r in selected:
+            if int(r.get("is_ioc", 0)) != 1:
+                continue
+            st = stage_for_edge(r, ioc_type_to_stage=ioc_type_to_stage, line_to_type=line_to_type)
+            if st:
+                counts[st] = counts.get(st, 0) + 1
+        pred = set(counts.keys())
+        pred_order = ordered_stage_sequence(pred)
+        inter = pred & obs
+        recall = float(len(inter)) / float(max(1, len(obs)))
+        precision = float(len(inter)) / float(max(1, len(pred))) if pred else 0.0
+        lcs_val = lcs_length(pred_order, gt_order)
+        out[str(int(k))] = {
+            "predicted_stages": sorted(pred),
+            "stage_recall": recall,
+            "stage_precision": precision,
+            "ordered_stage_recall_lcs": float(lcs_val) / float(max(1, len(gt_order))),
+            "lcs_length": int(lcs_val),
+            "chain_segments": build_chain_segments(
+                selected,
+                ioc_type_to_stage=ioc_type_to_stage,
+                line_to_type=line_to_type,
+                use_predicted=False,
+                pred_min_prob=0.0,
+            ),
+        }
+    return out, last_meta

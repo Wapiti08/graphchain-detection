@@ -6,7 +6,13 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 from gchain.eval.recon_alerts import evaluate_alert_reconstruction
 from gchain.eval.recon_pools import filter_rows_to_ioc_log_sources
 from gchain.eval.recon_stages import ordered_stage_sequence
-from gchain.eval.recon_topk import dedupe_rows_by_endpoint_pair, eval_topk_modes
+from gchain.eval.recon_topk import (
+    dedupe_rows_by_endpoint_pair,
+    eval_topk_group_cap,
+    eval_topk_group_cap_adaptive,
+    eval_topk_modes,
+    eval_topk_source_quota,
+)
 
 
 RECONSTRUCTION_NOTES: Dict[str, str] = {
@@ -37,6 +43,18 @@ RECONSTRUCTION_NOTES: Dict[str, str] = {
         "Ablation: dedupe to max score per (scenario, etype, src, dst) then global top-K and IOC stage "
         "labeling (reduces repeated DEPEND/INJECT hub edges). Primary metric remains by_k."
     ),
+    "by_k_source_quota": (
+        "Ablation: select top-K with per-source_file minimum quotas (eval-only), then stage labeling on IOC edges. "
+        "Primary metric remains by_k."
+    ),
+    "by_k_group_cap": (
+        "Ablation: select top-K with a per-group maximum count cap (eval-only) to prevent a single repeated pattern "
+        "from dominating top-K (softer than strict pair dedupe)."
+    ),
+    "by_k_group_cap_adaptive": (
+        "Ablation: adaptive group-cap that only caps groups that dominate the score head "
+        "(detected from a probe head of size K' = probe_mult * K)."
+    ),
 }
 
 
@@ -65,6 +83,17 @@ def evaluate_reconstruction(
     alert_min_events: int = 3,
     alert_topk_events: int = 0,
     alert_dedupe: bool = True,
+    source_file_min_quota: Optional[Mapping[str, int]] = None,
+    source_quota_exclude_etypes: Optional[Set[int]] = None,
+    source_quota_pair_dedupe: bool = True,
+    group_cap_key: str = "",
+    group_cap_max: int = 0,
+    group_cap_pair_dedupe: bool = True,
+    group_cap_adaptive_key: str = "",
+    group_cap_adaptive_probe_mult: int = 5,
+    group_cap_adaptive_hot_threshold: int = 20,
+    group_cap_adaptive_hot_cap: int = 10,
+    group_cap_adaptive_pair_dedupe: bool = True,
 ) -> Dict[str, Any]:
     obs = set((stages_gt.get("observable") or {}).get("stages") or [])
     sem = set((stages_gt.get("semantic") or {}).get("stages") or [])
@@ -120,6 +149,53 @@ def evaluate_reconstruction(
         ioc_ranked=False,
         endpoint_pair_dedupe=True,
     )
+
+    if source_file_min_quota:
+        quota, meta = eval_topk_source_quota(
+            rows,
+            obs=obs,
+            gt_order=gt_order,
+            ioc_type_to_stage=ioc_type_to_stage,
+            line_to_type=line_to_type,
+            topks=topks,
+            source_file_min_quota=source_file_min_quota,
+            exclude_etypes=source_quota_exclude_etypes,
+            endpoint_pair_dedupe=bool(source_quota_pair_dedupe),
+        )
+        metrics["candidate_pool_source_quota"] = meta
+        metrics["by_k_source_quota"] = quota
+
+    if str(group_cap_key).strip() and int(group_cap_max) > 0:
+        cap, meta = eval_topk_group_cap(
+            rows,
+            obs=obs,
+            gt_order=gt_order,
+            ioc_type_to_stage=ioc_type_to_stage,
+            line_to_type=line_to_type,
+            topks=topks,
+            cap_key=str(group_cap_key).strip(),
+            cap_max=int(group_cap_max),
+            endpoint_pair_dedupe=bool(group_cap_pair_dedupe),
+        )
+        metrics["candidate_pool_group_cap"] = meta
+        metrics["by_k_group_cap"] = cap
+
+    if str(group_cap_adaptive_key).strip() and int(group_cap_adaptive_hot_cap) > 0:
+        cap, meta = eval_topk_group_cap_adaptive(
+            rows,
+            obs=obs,
+            gt_order=gt_order,
+            ioc_type_to_stage=ioc_type_to_stage,
+            line_to_type=line_to_type,
+            topks=topks,
+            cap_key=str(group_cap_adaptive_key).strip(),
+            probe_mult=int(group_cap_adaptive_probe_mult),
+            hot_threshold=int(group_cap_adaptive_hot_threshold),
+            hot_cap_max=int(group_cap_adaptive_hot_cap),
+            endpoint_pair_dedupe=bool(group_cap_adaptive_pair_dedupe),
+        )
+        metrics["candidate_pool_group_cap_adaptive"] = meta
+        metrics["by_k_group_cap_adaptive"] = cap
 
     if include_ioc_pool_upper_bound:
         ub = eval_topk_modes(
