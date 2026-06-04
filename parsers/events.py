@@ -38,7 +38,7 @@ class Event:
     """
     Canonical event that can be turned into a (temporal) heterogeneous graph edge.
 
-    - `ts` is optional because some sources (e.g., QUT processed CSVs) are aggregated.
+    - `ts` is optional when a source has no wall-clock time.
       Graph builders can use `order` as a stable pseudo-time within a sequence.
     """
 

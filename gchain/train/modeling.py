@@ -45,25 +45,163 @@ def build_models(
     return memory, link_pred, etype_emb, stage_pred
 
 
+def _ioc_type_str_from_stream(st: "object", idx: int, *, stage_supervision: str) -> str:
+    mode = str(stage_supervision or "gt_ioc").strip().lower()
+    if mode == "gt_ioc":
+        tup = getattr(st, "ioc_type", None)
+    elif mode in {"rule", "rule_high"}:
+        tup = getattr(st, "rule_ioc_type", None)
+    else:
+        raise ValueError(f"Unknown stage_supervision: {stage_supervision!r}")
+    if tup is None:
+        return ""
+    return str(tup[idx] or "").strip()
+
+
 def build_stage_labels(
     *,
     streams: Dict[str, "object"],
     repo_root: "object",
     ioc_type_to_stage_idx: "object",
-    load_ioc_type_to_stage: "object",
+    load_stage_map: "object",
+    stage_supervision: str = "gt_ioc",
 ) -> Dict[str, "object"]:
+    """
+    Per-edge stage class indices (0 = none).
+
+    stage_supervision:
+      - gt_ioc: map GT ioc_type from stream (eval upper-bound style; uses IOC GT at export)
+      - rule: map rule_ioc_type where y_rule=1
+      - rule_high: map rule_ioc_type where y_rule_high=1 (deployment-aligned default)
+
+    Network IOC types (attack_ip, …) never receive stage CE for rule/rule_high.
+    """
     import torch
 
-    stage_map = load_ioc_type_to_stage(repo_root)
+    from gchain.train.stage_policy import is_ioc_type_stage_eligible
+
+    mode = str(stage_supervision or "gt_ioc").strip().lower()
+    repo_s = str(repo_root)
+    if mode not in {"gt_ioc", "rule", "rule_high"}:
+        raise ValueError(f"Unknown stage_supervision: {mode!r}")
+
+    stage_map = load_stage_map(repo_root)
     out: Dict[str, "object"] = {}
     for sc in sorted(streams.keys()):
         st = streams[sc]
-        it_tup = getattr(st, "ioc_type", None)
         n = int(st.src.numel())
         labels = torch.zeros(n, dtype=torch.long)
-        if it_tup is not None:
-            for idx_e in range(n):
-                labels[idx_e] = ioc_type_to_stage_idx(str(it_tup[idx_e]), stage_map)
+
+        if mode in {"rule", "rule_high"}:
+            rit = getattr(st, "rule_ioc_type", None)
+            if rit is None:
+                raise SystemExit(
+                    f"[{sc}] stage_supervision={mode!r} requires rule_ioc_type in *.tgn.pt. "
+                    "Regenerate graphs: python -m gchain.pipeline --dataset synthchain "
+                    f"--scenario {sc} --export-tgn"
+                )
+
+        for idx_e in range(n):
+            it = _ioc_type_str_from_stream(st, idx_e, stage_supervision=mode)
+            if mode in {"rule", "rule_high"}:
+                if not it or not is_ioc_type_stage_eligible(it, project_root=repo_s):
+                    labels[idx_e] = 0
+                    continue
+            labels[idx_e] = int(ioc_type_to_stage_idx(it, stage_map))
+
+        if mode == "rule":
+            y_rule = getattr(st, "y_rule", None)
+            if y_rule is not None:
+                labels = labels * (y_rule > 0).long()
+        elif mode == "rule_high":
+            y_rh = getattr(st, "y_rule_high", None)
+            if y_rh is not None:
+                labels = labels * (y_rh > 0).long()
+            else:
+                raise SystemExit(
+                    f"[{sc}] stage_supervision=rule_high requires y_rule_high in *.tgn.pt "
+                    "(regenerate graphs with weak_supervision_rules v2)."
+                )
+
         out[sc] = labels
     return out
 
+
+def freeze_ssl_backbone(
+    memory: "object",
+    link_pred: "object",
+    etype_emb: "object",
+) -> None:
+    """Stop gradient updates on TGN memory / link scorer / etype embedding."""
+    for module in (memory, link_pred, etype_emb):
+        for param in module.parameters():
+            param.requires_grad = False
+
+
+def load_training_checkpoint(
+    path: "object",
+    *,
+    memory: "object",
+    link_pred: "object",
+    etype_emb: "object",
+    stage_pred: Optional["object"] = None,
+    device: "object",
+) -> None:
+    import torch
+
+    ckpt = torch.load(str(path), map_location=device, weights_only=False)
+    memory.load_state_dict(ckpt["memory"])
+    link_pred.load_state_dict(ckpt["link_pred"])
+    etype_emb.load_state_dict(ckpt["etype_emb"])
+    if stage_pred is not None and ckpt.get("stage_pred") is not None:
+        stage_pred.load_state_dict(ckpt["stage_pred"])
+
+
+def count_stage_eligible_rule_labels(
+    st: "object",
+    labels: "object",
+    *,
+    stage_supervision: str,
+) -> int:
+    mode = str(stage_supervision or "gt_ioc").strip().lower()
+    if mode == "rule":
+        y_mask = getattr(st, "y_rule", None)
+    elif mode == "rule_high":
+        y_mask = getattr(st, "y_rule_high", None)
+    else:
+        return int((labels > 0).sum().item())
+    if y_mask is None:
+        return int((labels > 0).sum().item())
+    import torch
+
+    return int(((labels > 0) & (y_mask > 0)).sum().item())
+
+
+def validate_stage_supervision_streams(
+    streams: Dict[str, "object"],
+    *,
+    stage_supervision: str,
+    repo_root: "object",
+    ioc_type_to_stage_idx: "object",
+    load_stage_map: "object",
+) -> None:
+    """Fail fast when no stage-eligible weak-rule labels exist (network-only rules excluded)."""
+    mode = str(stage_supervision or "gt_ioc").strip().lower()
+    if mode not in {"rule", "rule_high"}:
+        return
+    labels_per_sc = build_stage_labels(
+        streams=streams,
+        repo_root=repo_root,
+        ioc_type_to_stage_idx=ioc_type_to_stage_idx,
+        load_stage_map=load_stage_map,
+        stage_supervision=mode,
+    )
+    for sc, labels in labels_per_sc.items():
+        st = streams[sc]
+        n_pos = count_stage_eligible_rule_labels(st, labels, stage_supervision=mode)
+        if n_pos == 0:
+            raise SystemExit(
+                f"[{sc}] No stage-eligible {mode} labels after supervision_policy "
+                "(network IOC types excluded from stage CE). "
+                "Use --lambda-stage 0, or add process/cmd rule hits, or --stage-supervision gt_ioc for ablations."
+            )

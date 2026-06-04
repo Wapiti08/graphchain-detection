@@ -17,9 +17,12 @@ class Stream:
     etype: "torch.Tensor"  # [E] int64
     y_ioc: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
     y_ioc_line: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
+    y_rule: Optional["torch.Tensor"] = None  # [E] int64 weak-rule hit
+    y_rule_high: Optional["torch.Tensor"] = None  # [E] int64 high-confidence rule
     row_idx: Optional["torch.Tensor"] = None  # [E] int64 (-1 if unknown)
     source_file: Optional[Tuple[str, ...]] = None
     ioc_type: Optional[Tuple[str, ...]] = None
+    rule_ioc_type: Optional[Tuple[str, ...]] = None
 
 
 def load_stream_from_tgn_pt(path: Path) -> Stream:
@@ -28,6 +31,7 @@ def load_stream_from_tgn_pt(path: Path) -> Stream:
     blob = torch.load(path, weights_only=True)
     sf = blob.get("source_file")
     it = blob.get("ioc_type")
+    rit = blob.get("rule_ioc_type")
     return Stream(
         src=blob["src"].long(),
         dst=blob["dst"].long(),
@@ -36,9 +40,12 @@ def load_stream_from_tgn_pt(path: Path) -> Stream:
         etype=blob["etype"].long(),
         y_ioc=(blob.get("y_ioc").long() if blob.get("y_ioc") is not None else None),
         y_ioc_line=(blob.get("y_ioc_line").long() if blob.get("y_ioc_line") is not None else None),
+        y_rule=(blob.get("y_rule").long() if blob.get("y_rule") is not None else None),
+        y_rule_high=(blob.get("y_rule_high").long() if blob.get("y_rule_high") is not None else None),
         row_idx=(blob.get("row_idx").long() if blob.get("row_idx") is not None else None),
         source_file=(tuple(str(x) for x in sf) if sf is not None else None),
         ioc_type=(tuple(str(x) for x in it) if it is not None else None),
+        rule_ioc_type=(tuple(str(x) for x in rit) if rit is not None else None),
     )
 
 
@@ -61,9 +68,12 @@ def offset_stream_nodes(st: Stream, base: int) -> Stream:
         etype=st.etype,
         y_ioc=st.y_ioc,
         y_ioc_line=st.y_ioc_line,
+        y_rule=st.y_rule,
+        y_rule_high=st.y_rule_high,
         row_idx=st.row_idx,
         source_file=st.source_file,
         ioc_type=st.ioc_type,
+        rule_ioc_type=st.rule_ioc_type,
     )
 
 
@@ -88,7 +98,6 @@ def ensure_scenario_stream(
 
     result = generate_graph(
         repo_root=repo_root,
-        dataset="synthchain",
         scenario=scenario,
         out=str(graphs_dir.relative_to(repo_root)),
         export_tgn=True,
@@ -104,7 +113,6 @@ def regenerate_scenario_stream(*, repo_root: Path, graphs_dir: Path, scenario: s
 
     generate_graph(
         repo_root=repo_root,
-        dataset="synthchain",
         scenario=scenario,
         out=str(graphs_dir.relative_to(repo_root)),
         export_tgn=True,

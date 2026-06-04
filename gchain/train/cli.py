@@ -22,7 +22,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description=(
             "Train/validate a TGN with time-split SSL (+ optional weak IOC/stage supervision). "
             "Use --input-mode synthchain for SynthChain scenarios, or --input-mode tgnpt with "
-            "--tgn-pt for any exported .tgn.pt stream (e.g. QUT-DV25)."
+            "--tgn-pt for a pre-exported .tgn.pt stream."
         )
     )
 
@@ -55,7 +55,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--tgn-pt",
         type=str,
         default="",
-        help="Path to a single .tgn.pt (QUT joined package, custom export, etc.).",
+        help="Path to a single .tgn.pt (custom export, etc.).",
     )
     tg.add_argument(
         "--name",

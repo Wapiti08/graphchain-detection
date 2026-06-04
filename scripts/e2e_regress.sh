@@ -26,13 +26,7 @@ echo "==> generate sc1 graph + TGN export (limited rows, fast)"
   --limit-per-file 400
 
 echo "==> pytest"
-QUT_CSV="${ROOT}/data/QUT-DV25_Datasets/QUT-DV25_Processed_Datasets/QUT-DV25_SysCall_Traces/QUT-DV25_SysCall_Traces.csv"
-if [[ -f "${QUT_CSV}" ]]; then
-  "${PY}" -m pytest tests/ -q --tb=short
-else
-  echo "WARN: QUT CSV not found; running SynthChain + TGN export tests only."
-  "${PY}" -m pytest tests/test_synthchain_parser.py tests/test_tgn_export.py -q --tb=short
-fi
+"${PY}" -m pytest tests/ -q --tb=short
 
 echo "==> train_tgn_sc1 (1 epoch)"
 "${PY}" scripts/train_tgn_sc1.py --epochs 1 --batch-size 256 --out artifacts/tgn_runs/e2e_smoke_sc1

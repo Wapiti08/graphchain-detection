@@ -67,7 +67,7 @@ def augment_events_with_causal(
 
     Time handling:
     - uses Event.ts if present
-    - otherwise uses Event.order (pseudo-time), so works on QUT processed graphs
+    - otherwise uses Event.order (pseudo-time) when ts is absent
 
     `window` is interpreted in the same unit as t(ev):
     - seconds if ts is present

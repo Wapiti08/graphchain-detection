@@ -17,72 +17,22 @@ class GenerateGraphResult:
     stats: Dict[str, Any]
 
 
-def _load_events(
+def _load_synthchain_events(
     *,
     repo_root: Path,
-    dataset: str,
     scenario: str,
-    qut_kind: str,
-    package_name: str,
     only_ioc_logs: bool,
     limit_per_file: Optional[int],
 ) -> tuple[List[Event], str]:
-    if dataset == "synthchain":
-        from parsers.synthchain import load_synthchain_events
+    from parsers.synthchain import load_synthchain_events
 
-        events = load_synthchain_events(
-            scenario,
-            project_root=repo_root,
-            only_ioc_logs=bool(only_ioc_logs),
-            limit_per_file=limit_per_file,
-        )
-        return events, f"synthchain_{scenario}"
-
-    import pandas as pd
-
-    from config.qut_sources import QUT_SOURCES
-    from parsers.qut.processed import (
-        parse_filetop_row,
-        parse_install_row,
-        parse_opensnoop_row,
-        parse_pattern_row,
-        parse_syscall_row,
-        parse_tcp_row,
+    events = load_synthchain_events(
+        scenario,
+        project_root=repo_root,
+        only_ioc_logs=bool(only_ioc_logs),
+        limit_per_file=limit_per_file,
     )
-
-    row_parsers = {
-        "install_traces": parse_install_row,
-        "syscall_traces": parse_syscall_row,
-        "opensnoop_traces": parse_opensnoop_row,
-        "filetop_traces": parse_filetop_row,
-        "tcp_traces": parse_tcp_row,
-        "pattern_traces": parse_pattern_row,
-    }
-
-    if qut_kind == "all":
-        if not package_name:
-            raise ValueError("--package-name is required when qut_kind=all")
-        from parsers.qut.join import load_qut_processed_dfs, parse_qut_joined_package
-
-        dfs = load_qut_processed_dfs(repo_root, limit_per_file=limit_per_file)
-        events = parse_qut_joined_package(package_name, dfs=dfs)
-        return events, f"qut_joined_{package_name}"
-
-    if qut_kind not in row_parsers:
-        raise ValueError(f"Unknown qut_kind={qut_kind!r}; expected one of {sorted(row_parsers)} or 'all'")
-
-    spec = QUT_SOURCES[qut_kind]
-    path = repo_root / spec.rel_path
-    df = pd.read_csv(path)
-    if limit_per_file is not None:
-        df = df.head(limit_per_file)
-
-    row_parser = row_parsers[qut_kind]
-
-    events: List[Event] = []
-    for _, row in df.iterrows():
-        events.extend(row_parser(row))
-    return events, f"qut_{qut_kind}"
+    return events, f"synthchain_{scenario}"
 
 
 def _save_graph_artifacts(
@@ -128,6 +78,8 @@ def _save_graph_artifacts(
             "etype": stream.etype,
             "y_ioc": stream.y_ioc,
             "y_ioc_line": stream.y_ioc_line,
+            "y_rule": stream.y_rule,
+            "y_rule_high": stream.y_rule_high,
         }
         if stream.row_idx is not None:
             payload["row_idx"] = stream.row_idx
@@ -135,6 +87,8 @@ def _save_graph_artifacts(
             payload["source_file"] = list(stream.source_file)
         if stream.ioc_type is not None:
             payload["ioc_type"] = list(stream.ioc_type)
+        if stream.rule_ioc_type is not None:
+            payload["rule_ioc_type"] = list(stream.rule_ioc_type)
         torch.save(payload, tgn_pt)
 
     if verbose:
@@ -157,11 +111,8 @@ def _save_graph_artifacts(
 def generate_graph(
     *,
     repo_root: Path,
-    dataset: str,
-    out: str | Path = "artifacts/graphs",
     scenario: str = "sc1",
-    qut_kind: str = "syscall_traces",
-    package_name: str = "",
+    out: str | Path = "artifacts/graphs",
     limit_per_file: Optional[int] = None,
     only_ioc_logs: bool = False,
     name: str = "",
@@ -171,12 +122,12 @@ def generate_graph(
     verbose: bool = True,
 ) -> GenerateGraphResult:
     """
-    Parse dataset events, build a heterogeneous graph, and write artifacts under ``out``.
+    Parse SynthChain events, build a heterogeneous graph, and write artifacts under ``out``.
 
     Returns paths to ``{stem}.pt``, ``{stem}.full.pt``, and optionally ``{stem}.tgn.pt``.
     """
     try:
-        import torch
+        import torch  # noqa: F401
     except ModuleNotFoundError as e:
         raise RuntimeError("Missing torch. Use the python env where torch+pyg are installed.") from e
 
@@ -184,12 +135,9 @@ def generate_graph(
     out_dir = (repo_root / out).resolve() if not Path(out).is_absolute() else Path(out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    events, default_stem = _load_events(
+    events, default_stem = _load_synthchain_events(
         repo_root=repo_root,
-        dataset=dataset,
         scenario=scenario,
-        qut_kind=qut_kind,
-        package_name=package_name,
         only_ioc_logs=only_ioc_logs,
         limit_per_file=limit_per_file,
     )
@@ -205,63 +153,6 @@ def generate_graph(
     )
 
 
-def generate_qut_all_packages(
-    *,
-    repo_root: Path,
-    out: str | Path = "artifacts/graphs",
-    limit_per_file: Optional[int] = None,
-    causal: str = "off",
-    causal_window: float = 50.0,
-    export_tgn: bool = True,
-    skip_existing: bool = False,
-    max_packages: Optional[int] = None,
-    verbose: bool = True,
-) -> List[GenerateGraphResult]:
-    """Batch-export ``qut_joined_<pkg>`` artifacts for every package (six tables loaded once)."""
-    from parsers.qut.join import list_qut_package_names, load_qut_processed_dfs, parse_qut_joined_package
-
-    repo_root = repo_root.resolve()
-    out_dir = (repo_root / out).resolve() if not Path(out).is_absolute() else Path(out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    packages = list_qut_package_names(repo_root, limit_per_file=limit_per_file)
-    if max_packages is not None:
-        packages = packages[: int(max_packages)]
-
-    if verbose:
-        print(f"QUT batch: {len(packages)} packages -> {out_dir}")
-
-    dfs = load_qut_processed_dfs(repo_root, limit_per_file=limit_per_file)
-    results: List[GenerateGraphResult] = []
-    skipped = 0
-
-    for i, pkg in enumerate(packages, start=1):
-        stem = f"qut_joined_{pkg}"
-        tgn_path = out_dir / f"{stem}.tgn.pt"
-        if skip_existing and export_tgn and tgn_path.is_file():
-            skipped += 1
-            continue
-
-        if verbose and (i == 1 or i % 100 == 0 or i == len(packages)):
-            print(f"[{i}/{len(packages)}] {pkg}")
-
-        events = parse_qut_joined_package(pkg, dfs=dfs)
-        res = _save_graph_artifacts(
-            events=events,
-            stem=stem,
-            out_dir=out_dir,
-            causal=causal,
-            causal_window=causal_window,
-            export_tgn=export_tgn,
-            verbose=False,
-        )
-        results.append(res)
-
-    if verbose:
-        print(f"QUT batch done: wrote {len(results)}, skipped {skipped} (existing .tgn.pt)")
-    return results
-
-
 def generate_synthchain_all_scenarios(
     *,
     repo_root: Path,
@@ -275,7 +166,7 @@ def generate_synthchain_all_scenarios(
     skip_existing: bool = False,
     verbose: bool = True,
 ) -> List[GenerateGraphResult]:
-    """批量导出 SynthChain sc1..sc7（或自定义 scenario 列表）的 .tgn.pt。"""
+    """Batch-export SynthChain sc1..sc7 (or custom scenario list) .tgn.pt artifacts."""
     if scenarios is None:
         scenarios = [f"sc{i}" for i in range(1, 8)]
 
@@ -292,12 +183,9 @@ def generate_synthchain_all_scenarios(
         tgn_path = out_dir / f"{stem}.tgn.pt"
         if skip_existing and export_tgn and tgn_path.is_file():
             continue
-        events, _ = _load_events(
+        events, _ = _load_synthchain_events(
             repo_root=repo_root,
-            dataset="synthchain",
             scenario=sc,
-            qut_kind="all",
-            package_name="",
             only_ioc_logs=only_ioc_logs,
             limit_per_file=limit_per_file,
         )

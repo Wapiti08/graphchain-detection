@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
-from graphcore.edge_meta import primary_ioc_type_from_attrs
+from graphcore.edge_meta import primary_ioc_type_from_attrs, primary_rule_ioc_type_from_attrs
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -19,9 +19,12 @@ class TGNEventStream:
     etype: "torch.Tensor" # [E] int64
     y_ioc: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
     y_ioc_line: Optional["torch.Tensor"] = None  # [E] int64 (0/1)
+    y_rule: Optional["torch.Tensor"] = None  # [E] int64 weak-rule hit (any confidence)
+    y_rule_high: Optional["torch.Tensor"] = None  # [E] int64 high-confidence rule hit
     row_idx: Optional["torch.Tensor"] = None  # [E] int64 (-1 if unknown)
     source_file: Optional[Tuple[str, ...]] = None  # len E
     ioc_type: Optional[Tuple[str, ...]] = None  # len E (primary IOC type, "" if none)
+    rule_ioc_type: Optional[Tuple[str, ...]] = None  # len E (weak-rule pseudo IOC type)
     meta: Optional[Dict[str, Any]] = None
 
 
@@ -134,9 +137,12 @@ def hetero_to_tgn_event_stream(
     msg_all: List[List[float]] = []
     y_ioc_all: List[int] = []
     y_ioc_line_all: List[int] = []
+    y_rule_all: List[int] = []
+    y_rule_high_all: List[int] = []
     row_idx_all: List[int] = []
     source_file_all: List[str] = []
     ioc_type_all: List[str] = []
+    rule_ioc_type_all: List[str] = []
     meta: Dict[str, Any] = {"edge_type": []} if include_meta else {}
     if include_meta:
         # With `node_offsets` + `num_nodes_by_type`, you can deterministically decode:
@@ -167,10 +173,13 @@ def hetero_to_tgn_event_stream(
             msg_all.append(_vectorize_edge_attrs(raw_attrs, cat_hash_buckets=cat_hash_buckets))
             y_ioc_all.append(1 if bool(raw_attrs.get("is_ioc")) else 0)
             y_ioc_line_all.append(1 if bool(raw_attrs.get("is_ioc_line")) else 0)
+            y_rule_all.append(1 if bool(raw_attrs.get("is_rule_hit")) else 0)
+            y_rule_high_all.append(1 if bool(raw_attrs.get("is_rule_hit_high")) else 0)
             ri = raw_attrs.get("_row_idx")
             row_idx_all.append(int(ri) if isinstance(ri, int) else -1)
             source_file_all.append(str(raw_attrs.get("_source_file") or ""))
             ioc_type_all.append(primary_ioc_type_from_attrs(raw_attrs))
+            rule_ioc_type_all.append(primary_rule_ioc_type_from_attrs(raw_attrs))
             if include_meta:
                 meta["edge_type"].append(et)
 
@@ -182,6 +191,8 @@ def hetero_to_tgn_event_stream(
     msg = torch.tensor([msg_all[i] for i in order], dtype=torch.float)
     y_ioc = torch.tensor([y_ioc_all[i] for i in order], dtype=torch.long)
     y_ioc_line = torch.tensor([y_ioc_line_all[i] for i in order], dtype=torch.long)
+    y_rule = torch.tensor([y_rule_all[i] for i in order], dtype=torch.long)
+    y_rule_high = torch.tensor([y_rule_high_all[i] for i in order], dtype=torch.long)
     row_idx = torch.tensor([row_idx_all[i] for i in order], dtype=torch.long)
 
     return TGNEventStream(
@@ -192,9 +203,12 @@ def hetero_to_tgn_event_stream(
         etype=etype,
         y_ioc=y_ioc,
         y_ioc_line=y_ioc_line,
+        y_rule=y_rule,
+        y_rule_high=y_rule_high,
         row_idx=row_idx,
         source_file=tuple(source_file_all[i] for i in order),
         ioc_type=tuple(ioc_type_all[i] for i in order),
+        rule_ioc_type=tuple(rule_ioc_type_all[i] for i in order),
         meta=(meta if include_meta else None),
     )
 

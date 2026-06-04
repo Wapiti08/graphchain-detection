@@ -33,6 +33,12 @@ def _read_score_rows(path: Path) -> List[Dict[str, Any]]:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--scores-csv", type=str, required=True, help="best_eval_tail_scores.csv from training.")
+    p.add_argument(
+        "--scenario-filter",
+        type=str,
+        default="",
+        help="Keep only score rows with this scenario id (e.g. sc5). For joint/multi-scenario CSVs.",
+    )
     p.add_argument("--stage-gt", type=str, required=True, help="artifacts/stage_gt/<sc>.stages_gt.json")
     p.add_argument(
         "--ioc-gt",
@@ -173,10 +179,28 @@ def main() -> None:
     ioc_gt_path = (repo / args.ioc_gt).resolve()
 
     rows = _read_score_rows(scores_csv)
+    scenario_filter = str(args.scenario_filter or "").strip()
+    if scenario_filter:
+        rows = [r for r in rows if str(r.get("scenario") or "").strip() == scenario_filter]
+        if not rows:
+            raise SystemExit(
+                f"No score rows for --scenario-filter {scenario_filter!r} in {scores_csv}. "
+                "Check the CSV scenario column or omit the filter."
+            )
+
     stages_gt = load_json(stage_gt_path)
     scenario = str(stages_gt.get("scenario") or "")
-    if not scenario and rows:
+    if scenario_filter:
+        scenario = scenario_filter
+    elif not scenario and rows:
         scenario = str(rows[0].get("scenario") or "")
+
+    gt_scenario = str(stages_gt.get("scenario") or "").strip()
+    if scenario_filter and gt_scenario and gt_scenario != scenario_filter:
+        print(
+            f"warning: --scenario-filter {scenario_filter!r} != stage_gt scenario {gt_scenario!r}",
+            file=sys.stderr,
+        )
 
     ioc_gt = load_json(ioc_gt_path)
     ioc_type_to_stage = load_ioc_type_to_stage(repo)
@@ -242,6 +266,8 @@ def main() -> None:
     metrics["scores_csv"] = str(scores_csv)
     metrics["stage_gt"] = str(stage_gt_path)
     metrics["n_score_rows"] = len(rows)
+    if scenario_filter:
+        metrics["scenario_filter"] = scenario_filter
 
     if bool(args.no_pair_dedupe_recon):
         metrics.pop("by_k_pair_dedupe", None)

@@ -18,10 +18,17 @@ from gchain.train.metrics import (
     selection_score,
     topk_ioc_hits,
 )
-from gchain.train.modeling import build_models, build_stage_labels
+from gchain.train.modeling import (
+    build_models,
+    build_stage_labels,
+    freeze_ssl_backbone,
+    load_training_checkpoint,
+    validate_stage_supervision_streams,
+)
 from gchain.train.neg_sampling import build_neg_pools, build_time_pools, inbatch_neg_dst, sample_window_neg_dst
 from gchain.train.split import time_split_idx
 from gchain.train.streams import Stream, ensure_scenario_stream, load_stream_from_tgn_pt, num_nodes_in_stream, offset_stream_nodes, regenerate_scenario_stream
+from gchain.train.supervision import rank_supervision_tensor
 
 
 def _parse_scenarios(s: str) -> List[str]:
@@ -138,6 +145,16 @@ def train(
     raw_msg_dim = int(next(iter(streams.values())).msg.size(-1)) + int(args.etype_dim)
 
     use_stage = float(args.lambda_stage) > 0.0
+    stage_supervision = str(getattr(args, "stage_supervision", "gt_ioc"))
+    if use_stage:
+        validate_stage_supervision_streams(
+            streams,
+            stage_supervision=stage_supervision,
+            repo_root=repo_root,
+            ioc_type_to_stage_idx=ioc_type_to_stage_idx,
+            load_stage_map=load_ioc_type_to_stage,
+        )
+
     memory, link_pred, etype_emb, stage_pred = build_models(
         num_nodes=num_nodes,
         num_etypes=num_etypes,
@@ -155,13 +172,40 @@ def train(
         streams=streams,
         repo_root=repo_root,
         ioc_type_to_stage_idx=ioc_type_to_stage_idx,
-        load_ioc_type_to_stage=load_ioc_type_to_stage,
+        load_stage_map=load_ioc_type_to_stage,
+        stage_supervision=stage_supervision,
     )
 
-    all_params = list(memory.parameters()) + list(link_pred.parameters()) + list(etype_emb.parameters())
-    if stage_pred is not None:
-        all_params += list(stage_pred.parameters())
-    opt = torch.optim.Adam(all_params, lr=float(args.lr))
+    freeze_ssl = bool(getattr(args, "freeze_ssl_backbone", False))
+    if freeze_ssl and not use_stage:
+        raise SystemExit("--freeze-ssl-backbone requires --lambda-stage > 0")
+
+    init_ckpt = str(getattr(args, "init_ckpt", "") or "").strip()
+    if init_ckpt:
+        ckpt_path = (repo_root / init_ckpt).resolve() if not Path(init_ckpt).is_absolute() else Path(init_ckpt)
+        if not ckpt_path.is_file():
+            raise SystemExit(f"--init-ckpt not found: {ckpt_path}")
+        load_training_checkpoint(
+            ckpt_path,
+            memory=memory,
+            link_pred=link_pred,
+            etype_emb=etype_emb,
+            stage_pred=stage_pred,
+            device=device,
+        )
+        print(f"Loaded init checkpoint: {ckpt_path}", flush=True)
+    elif freeze_ssl:
+        raise SystemExit("--freeze-ssl-backbone requires --init-ckpt (train SSL first, then stage-only).")
+
+    if freeze_ssl:
+        freeze_ssl_backbone(memory, link_pred, etype_emb)
+        opt = torch.optim.Adam(stage_pred.parameters(), lr=float(args.lr))
+        print("freeze_ssl_backbone: training stage_pred only (no link BCE backward).", flush=True)
+    else:
+        all_params = list(memory.parameters()) + list(link_pred.parameters()) + list(etype_emb.parameters())
+        if stage_pred is not None:
+            all_params += list(stage_pred.parameters())
+        opt = torch.optim.Adam(all_params, lr=float(args.lr))
     assoc = torch.empty(num_nodes, dtype=torch.long, device=device).fill_(-1)
 
     def sample_neg(true_dst: "torch.Tensor", e: "torch.Tensor", pools: Dict[int, "torch.Tensor"]) -> "torch.Tensor":
@@ -194,6 +238,9 @@ def train(
         y_ioc = getattr(st, "y_ioc", None)
         if y_ioc is not None:
             y_ioc = y_ioc.to(device)
+        y_rank = rank_supervision_tensor(st, str(getattr(args, "rank_supervision", "ioc")))
+        if y_rank is not None:
+            y_rank = y_rank.to(device)
         row_idx_cpu = getattr(st, "row_idx", None)
         source_file = getattr(st, "source_file", None)
         ioc_type = getattr(st, "ioc_type", None)
@@ -216,10 +263,16 @@ def train(
 
         y_stage_sc = y_stage_per_sc.get(sc)
 
+        freeze_ssl = bool(getattr(args, "freeze_ssl_backbone", False))
         if train_mode:
-            memory.train()
-            link_pred.train()
-            etype_emb.train()
+            if freeze_ssl:
+                memory.eval()
+                link_pred.eval()
+                etype_emb.eval()
+            else:
+                memory.train()
+                link_pred.train()
+                etype_emb.train()
             if stage_pred is not None:
                 stage_pred.train()
         else:
@@ -294,23 +347,26 @@ def train(
             if bool(args.train_only_benign) and train_mode and prefix_only and (y_ioc is not None):
                 benign_mask = (y_ioc[i:j] == 0)
 
-            if benign_mask is not None:
-                if int(benign_mask.sum().item()) == 0:
-                    loss = None
+            loss = None
+            freeze_ssl = bool(getattr(args, "freeze_ssl_backbone", False))
+            if not (train_mode and freeze_ssl):
+                if benign_mask is not None:
+                    if int(benign_mask.sum().item()) == 0:
+                        loss = None
+                    else:
+                        pos_logit_eff = pos_logit[benign_mask]
+                        neg_logit_eff = neg_logit[benign_mask]
+                        y = torch.cat([torch.ones_like(pos_logit_eff), torch.zeros_like(neg_logit_eff)], dim=0)
+                        logit = torch.cat([pos_logit_eff, neg_logit_eff], dim=0)
+                        loss = F.binary_cross_entropy_with_logits(logit, y)
                 else:
-                    pos_logit_eff = pos_logit[benign_mask]
-                    neg_logit_eff = neg_logit[benign_mask]
-                    y = torch.cat([torch.ones_like(pos_logit_eff), torch.zeros_like(neg_logit_eff)], dim=0)
-                    logit = torch.cat([pos_logit_eff, neg_logit_eff], dim=0)
+                    y = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)], dim=0)
+                    logit = torch.cat([pos_logit, neg_logit], dim=0)
                     loss = F.binary_cross_entropy_with_logits(logit, y)
-            else:
-                y = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)], dim=0)
-                logit = torch.cat([pos_logit, neg_logit], dim=0)
-                loss = F.binary_cross_entropy_with_logits(logit, y)
 
             aux_active = use_aux_supervision and train_mode and (sc in train_scenarios_set)
-            if loss is not None and aux_active and float(args.lambda_ioc_rank) > 0.0 and y_ioc is not None:
-                yb = y_ioc[i:j].float()
+            if loss is not None and aux_active and float(args.lambda_ioc_rank) > 0.0 and y_rank is not None:
+                yb = y_rank[i:j].float()
                 pos_prob = torch.sigmoid(pos_logit).view(-1)
                 score_anom = -torch.log(pos_prob.clamp_min(1e-12))
                 mask_i = yb > 0.5
@@ -331,11 +387,15 @@ def train(
                     stage_logits = stage_pred(pos_inp)
                     loss_stage = F.cross_entropy(stage_logits[has_label], stage_labels_batch[has_label])
                     loss = loss + float(args.lambda_stage) * loss_stage
-                # Regularize stage head on non-IOC edges -> 'none' (class 0)
-                # This is important for real-world use where we cannot filter by IOC.
-                if float(getattr(args, "lambda_stage_none", 0.0)) > 0.0 and y_ioc is not None:
-                    yb = y_ioc[i:j].to(device).view(-1)
-                    mask_none = (yb == 0)
+                # Push unlabeled edges toward stage 'none' (class 0).
+                if float(getattr(args, "lambda_stage_none", 0.0)) > 0.0:
+                    if stage_supervision in {"rule", "rule_high"}:
+                        mask_none = stage_labels_batch == 0
+                    elif y_ioc is not None:
+                        yb = y_ioc[i:j].to(device).view(-1)
+                        mask_none = yb == 0
+                    else:
+                        mask_none = stage_labels_batch == 0
                     if int(mask_none.sum().item()) > 0:
                         # Optional downsampling to control imbalance/compute.
                         ratio = float(getattr(args, "stage_none_sample_ratio", 1.0))
@@ -355,20 +415,25 @@ def train(
                 opt.step()
 
             with torch.no_grad():
-                if benign_mask is not None:
+                if train_mode and freeze_ssl:
+                    if loss is not None:
+                        total_loss += float(loss.item())
+                        count += 1.0
+                elif benign_mask is not None:
                     if int(benign_mask.sum().item()) > 0:
                         prob = torch.sigmoid(logit)
                         pred = (prob > 0.5).float()
                         correct += float((pred == y).sum().item())
                         count += float(y.numel())
-                        assert loss is not None
-                        total_loss += float(loss.item()) * float(y.numel())
+                        if loss is not None:
+                            total_loss += float(loss.item()) * float(y.numel())
                 else:
                     prob = torch.sigmoid(logit)
                     pred = (prob > 0.5).float()
                     correct += float((pred == y).sum().item())
                     count += float(y.numel())
-                    total_loss += float(loss.item()) * float(y.numel())
+                    if loss is not None:
+                        total_loss += float(loss.item()) * float(y.numel())
 
                 if collect_eval:
                     pos_prob = torch.sigmoid(pos_logit)
@@ -655,8 +720,14 @@ def train(
         "train_scenarios": train_scenarios,
         "test_scenarios": test_scenarios,
         "aux_supervision": str(args.aux_supervision),
+        "msg_dim": int(next(iter(streams.values())).msg.size(-1)) if streams else None,
         "lambda_ioc_rank": float(args.lambda_ioc_rank),
+        "rank_supervision": str(getattr(args, "rank_supervision", "ioc")),
+        "stage_supervision": stage_supervision,
         "lambda_stage": float(args.lambda_stage),
+        "lambda_stage_none": float(getattr(args, "lambda_stage_none", 0.0)),
+        "freeze_ssl_backbone": bool(getattr(args, "freeze_ssl_backbone", False)),
+        "init_ckpt": str(getattr(args, "init_ckpt", "") or ""),
         "epochs": int(args.epochs),
         "epochs_completed": int(last_completed_epoch),
         "early_stopped": bool(last_completed_epoch < int(args.epochs)),

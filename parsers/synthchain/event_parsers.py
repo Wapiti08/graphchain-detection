@@ -35,6 +35,8 @@ def load_synthchain_events(
     limit_per_file: Optional[int] = None,
     ioc_ground_truth_path: str | Path | None = "data/SynthChain/iocs/ioc_ground_truth.json",
     *,
+    annotate_weak_rules: bool = True,
+    weak_rules_path: str | Path | None = "config/weak_supervision_rules.json",
     verbose: bool = False,
 ) -> List[Event]:
     """
@@ -145,6 +147,27 @@ def load_synthchain_events(
                 out = annotate_events_with_iocs(out, idx)
                 if debug:
                     print(f"[load_synthchain_events] annotate_events_with_iocs output_events={len(out)}")
+
+    if annotate_weak_rules:
+        wr_path = Path(project_root) / str(weak_rules_path or "config/weak_supervision_rules.json")
+        if wr_path.exists():
+            from parsers.rules.weak_supervision import (
+                annotate_events_with_weak_rules,
+                ioc_log_source_map_for_scenario,
+                load_weak_supervision_rules,
+            )
+
+            rules = load_weak_supervision_rules(str(project_root))
+            src_map = ioc_log_source_map_for_scenario(scenario_id, Path(project_root))
+            if debug:
+                print(f"[load_synthchain_events] annotate_events_with_weak_rules input_events={len(out)}")
+            out = annotate_events_with_weak_rules(out, rules, ioc_log_sources=src_map)
+            if debug:
+                n_hit = sum(1 for e in out if e.edge_attrs.get("is_rule_hit"))
+                print(
+                    f"[load_synthchain_events] weak_rules hits={n_hit}/{len(out)} "
+                    f"high={sum(1 for e in out if e.edge_attrs.get('is_rule_hit_high'))}"
+                )
 
     if debug:
         print(f"[load_synthchain_events] total_events={len(out)}")

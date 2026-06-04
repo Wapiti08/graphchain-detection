@@ -55,14 +55,45 @@ def add_training_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-eval-alert-dedupe", action="store_true")
     p.add_argument("--lambda-ioc-rank", type=float, default=0.0)
     p.add_argument("--ioc-rank-margin", type=float, default=0.5)
+    p.add_argument(
+        "--rank-supervision",
+        type=str,
+        default="ioc",
+        choices=["off", "ioc", "ioc_line", "rule", "rule_high"],
+        help=(
+            "Edges used for ranking aux loss (--lambda-ioc-rank): GT ioc (default), "
+            "ioc_line, or weak rules (rule / rule_high)."
+        ),
+    )
     p.add_argument("--lambda-stage", type=float, default=0.0)
+    p.add_argument(
+        "--stage-supervision",
+        type=str,
+        default="gt_ioc",
+        choices=["gt_ioc", "rule", "rule_high"],
+        help=(
+            "Stage CE labels: gt_ioc (IOC type from GT export; eval-oriented), "
+            "rule / rule_high (rule_ioc_type on y_rule / y_rule_high; deployment-aligned)."
+        ),
+    )
     p.add_argument(
         "--lambda-stage-none",
         type=float,
         default=0.0,
-        help="Aux CE pushing non-IOC edges to stage 'none' on train prefix.",
+        help="Aux CE on edges without a stage label: gt_ioc uses y_ioc==0; rule* uses unlabeled edges.",
     )
     p.add_argument("--stage-none-sample-ratio", type=float, default=1.0)
+    p.add_argument(
+        "--freeze-ssl-backbone",
+        action="store_true",
+        help="Train stage_pred only: no link BCE backward; requires --init-ckpt from prior SSL run.",
+    )
+    p.add_argument(
+        "--init-ckpt",
+        type=str,
+        default="",
+        help="Load memory/link_pred/etype_emb (and stage_pred if present) before training.",
+    )
     p.add_argument("--stage-hidden-dim", type=int, default=64)
     p.add_argument(
         "--aux-supervision",

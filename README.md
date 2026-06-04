@@ -1,4 +1,4 @@
-# GraphChain-Detection
+# FuseChain-Detection
 detection of ongoing supply chain vulnerabilities with temporal graph neural networks
 
 ## Python packages
@@ -122,18 +122,70 @@ The canonical graph schema is based on HetHunt's heterogeneous runtime graph and
 - DNS attrs: `query_domain`, `query_type`, `answers`, `rcode`
 
 
+## Deployment-aligned protocol (link + rule stage + recon)
+
+Training uses **no GT IOC line/value labels**. Stage supervision comes from
+`config/weak_supervision_rules.json` → `rule_ioc_type` on `y_rule_high` edges only.
+Evaluation still uses held-out stage GT (`artifacts/stage_gt/*.json`) for metrics.
+
+| Phase | What runs | Deployable? |
+|-------|-----------|-------------|
+| Train prefix | SSL link loss + optional stage CE (`--stage-supervision rule_high`) | Yes |
+| Train (avoid as primary) | `--stage-supervision gt_ioc`, `--rank-supervision ioc_line` | No (oracle) |
+| Inference | Anomaly score on all edges + `pred_stage` in scores CSV | Yes |
+| Reporting | `by_k_pred_stage`, `by_k_group_cap_adaptive`, optional `by_alert_pred_stage` | Post-hoc / analyst view |
+| Lab metric only | `by_k` (stages from GT IOC edges in top-K) | Eval upper-bound style |
+
+Regenerate graphs (weak rules v2 in stream):
+
+```bash
+python -m gchain.pipeline --dataset synthchain --all-scenarios --only-ioc-logs --export-tgn
+```
+
+Run deployment-aligned per-scenario training + adaptive recon:
+
+```bash
+EPOCHS=20 DEVICE=cuda bash scripts/run_per_scenario_rule_stage.sh all
+# summary: artifacts/tgn_runs/synthchain_summary_rule_stage.csv
+```
+
+Manual train flags (equivalent):
+
+```bash
+python scripts/train_tgn_synthchain.py --scenarios sc4 \
+  --lambda-stage 0.5 --lambda-stage-none 0.1 --stage-supervision rule_high \
+  --lambda-ioc-rank 0 --rank-supervision off \
+  --save-scores --save-scores-split all --select-metric auprc \
+  --out artifacts/tgn_runs/per_scenario_sc4_rule_stage
+```
+
+Primary SSL + adaptive recon (research baseline) remains `bash scripts/run_per_scenario_ssl_recon.sh`.
+Weak-rule **ranking** ablation: `bash scripts/run_per_scenario_weak_rule.sh`.
+
+### Code map (what was added/changed)
+
+| Area | Path | Change |
+|------|------|--------|
+| Rules | `config/weak_supervision_rules.json` | v2 rank_policy; benign install cmd excluded from rank |
+| Annotate | `parsers/rules/weak_supervision.py` | `infer_rule_hits_for_event`, `annotate_events_with_weak_rules` |
+| Parser hook | `parsers/synthchain/event_parsers.py` | `annotate_weak_rules=True` on load |
+| TGN export | `graphcore/tgn_input.py`, `graphcore/edge_meta.py` | `y_rule`, `y_rule_high`, `rule_ioc_type` in `.tgn.pt` |
+| Pipeline | `gchain/pipeline/generate.py` | save `rule_ioc_type` in blob |
+| Train CLI | `gchain/train/args_common.py` | `--stage-supervision`, `--rank-supervision` |
+| Stage labels | `gchain/train/modeling.py` | `build_stage_labels(..., stage_supervision=rule_high)` |
+| Streams | `gchain/train/streams.py` | load `rule_ioc_type` from `.tgn.pt` |
+| Train loop | `gchain/train/train_loop.py` | stage CE + `lambda_stage_none` for deployable masks |
+| Rank aux | `gchain/train/supervision.py` | `rank_supervision_tensor()` |
+| Script (rank ablation) | `scripts/run_per_scenario_weak_rule.sh` | rule rank + adaptive recon |
+| Script (deploy) | `scripts/run_per_scenario_rule_stage.sh` | **link + rule stage**, no rank loss |
+| Tests | `tests/test_weak_supervision_rules.py` | rule v2 policy tests |
+
 ## Quick Running
 ```
 python -m gchain.pipeline --dataset synthchain --scenario sc1
 
 # (recommended) export flattened TGN event stream
 python -m gchain.pipeline --dataset synthchain --scenario sc1 --export-tgn
-
-# QUT joined package (six trace tables: install/syscall/opensnoop/filetop/tcp/pattern)
-python -m gchain.pipeline --dataset qut --qut-kind all --package-name cracker --export-tgn
-
-# QUT: batch-export all packages' .tgn.pt (loads six CSVs once; ~14k packages — use --max-packages for smoke)
-python -m gchain.pipeline --dataset qut --qut-kind all --all-packages --export-tgn --skip-existing
 
 # SynthChain: batch-export sc1..sc7 .tgn.pt
 python -m gchain.pipeline --dataset synthchain --all-scenarios --export-tgn
@@ -165,7 +217,7 @@ bash scripts/run_loso_synthchain.sh
 python scripts/aggregate_alerts.py --scores-csv artifacts/tgn_runs/synthchain_multi/best_eval_tail_scores.csv --out-dir artifacts/alerts
 
 # full pipeline smoke: pytest + sc1 graph/TGN + 1-epoch train + tail scores + aggregate
-# needs data/SynthChain; if QUT CSV is absent, only SynthChain-related tests run
+# needs data/SynthChain
 bash scripts/e2e_regress.sh
 
 # generate ground truth stage mapping data

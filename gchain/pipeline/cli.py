@@ -8,54 +8,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate temporal heterogeneous graphs and optional TGN streams.")
     p.add_argument(
         "--dataset",
-        choices=["synthchain", "qut"],
-        required=True,
-        help="Dataset to parse and build graph from.",
+        choices=["synthchain"],
+        default="synthchain",
+        help="Dataset to parse and build graph from (SynthChain only).",
     )
     p.add_argument(
         "--scenario",
         type=str,
         default="sc1",
-        help="Scenario id for synthchain (e.g., sc1..sc7).",
-    )
-    from config.qut_sources import QUT_KIND_CHOICES
-
-    p.add_argument(
-        "--qut-kind",
-        type=str,
-        default="all",
-        choices=sorted(QUT_KIND_CHOICES),
-        help=(
-            "Which QUT processed CSV to parse, or 'all' to join six trace families "
-            "(install, syscall, opensnoop, filetop, tcp, pattern) for --package-name."
-        ),
-    )
-    p.add_argument(
-        "--package-name",
-        type=str,
-        default="",
-        help="QUT: one package when using --qut-kind all (omit when --all-packages).",
-    )
-    p.add_argument(
-        "--all-packages",
-        action="store_true",
-        help="QUT only: export qut_joined_<pkg> for every Package_Name (requires --qut-kind all).",
+        help="Scenario id (e.g., sc1..sc7).",
     )
     p.add_argument(
         "--all-scenarios",
         action="store_true",
-        help="SynthChain only: export synthchain_sc1..sc7 (or override with --scenarios).",
+        help="Export synthchain_sc1..sc7 (or override with comma-separated --scenario).",
     )
     p.add_argument(
         "--skip-existing",
         action="store_true",
-        help="With --all-packages / --all-scenarios, skip if target .tgn.pt already exists.",
-    )
-    p.add_argument(
-        "--max-packages",
-        type=int,
-        default=None,
-        help="QUT batch only: process at most this many packages (smoke tests).",
+        help="With --all-scenarios, skip if target .tgn.pt already exists.",
     )
     p.add_argument(
         "--limit-per-file",
@@ -66,7 +37,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--only-ioc-logs",
         action="store_true",
-        help="Synthchain only: only parse logs marked has_ioc=True.",
+        help="Only parse logs marked has_ioc=True.",
     )
     p.add_argument(
         "--out",

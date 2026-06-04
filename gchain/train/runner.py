@@ -17,7 +17,7 @@ def cli_main(argv: Optional[List[str]] = None) -> None:
         if not tgn_path.exists():
             raise SystemExit(
                 f"Missing `{tgn_path}`. Generate via gchain.pipeline, e.g.\n"
-                f"  python -m gchain.pipeline --dataset qut --qut-kind all --package-name <PKG> --export-tgn"
+                f"  python -m gchain.pipeline --scenario sc1 --export-tgn"
             )
 
         name = str(args.name).strip() or tgn_path.stem.replace(".tgn", "")

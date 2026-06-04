@@ -1,0 +1,78 @@
+{
+  "version": 2,
+  "description": "Scenario-agnostic weak supervision (no GT line/value IOCs). v2 rank_policy: skip benign package-install cmd patterns; rule_high only on IOC log sources with strong or multi-signal hits.",
+  "rule_type_to_ioc_type": {
+    "suricata_alert": "attack_ip",
+    "lolbin_bitsadmin": "execution",
+    "lolbin_certutil": "execution",
+    "lolbin_encoded_ps": "defense_evasion",
+    "lolbin_download_cradle": "execution_chain",
+    "inject_edge": "process_injection",
+    "suspicious_port": "suspicious_port",
+    "tier2_pipe_to_shell": "execution_chain"
+  },
+  "rank_policy": {
+    "require_ioc_log_source_for_high": true,
+    "min_rule_types_for_high": 2,
+    "strong_rule_types_single_hit": [
+      "suricata_alert",
+      "inject_edge",
+      "lolbin_encoded_ps",
+      "tier2_pipe_to_shell"
+    ],
+    "exclude_rule_types": [
+      "tier2_setup_py_install",
+      "tier2_pip_user_target",
+      "tier2_npm_postinstall",
+      "tier2_docker_remote_fetch"
+    ],
+    "lolbin_download_single_flag_max_confidence": "medium"
+  },
+  "tier1": {
+    "suricata_source_suffixes": ["eve.json"],
+    "suricata_cmdline_markers": ["et ", "suricata", "alert"],
+    "lolbin_flags": {
+      "has_bitsadmin": "lolbin_bitsadmin",
+      "has_certutil": "lolbin_certutil",
+      "has_base64_flag": "lolbin_encoded_ps",
+      "has_invoke_expression": "lolbin_encoded_ps",
+      "has_invoke_webrequest": "lolbin_download_cradle",
+      "has_curl": "lolbin_download_cradle",
+      "has_wget": "lolbin_download_cradle"
+    },
+    "lolbin_requires_second_flag_for_high": [
+      "has_curl",
+      "has_wget",
+      "has_invoke_webrequest"
+    ],
+    "inject_edge_types": ["INJECT"],
+    "connect_edge_types": ["CONNECT", "RELAY", "REDIRECT"],
+    "suspicious_ports": [2121, 4444, 5000, 50000, 8081, 8443, 9001]
+  },
+  "tier2_cmdline_patterns": [
+    {
+      "id": "tier2_pipe_to_shell",
+      "pattern": "(?i)(?:curl|wget)\\s+[^|]+\\|\\s*(?:ba)?sh",
+      "confidence": "high",
+      "rank_eligible": true
+    }
+  ],
+  "tier2_benign_adjacent_disabled": [
+    {
+      "id": "tier2_setup_py_install",
+      "note": "Normal PyPI/npm install; overlaps benign supply-chain activity — not used for rank."
+    },
+    {
+      "id": "tier2_pip_user_target",
+      "note": "pip install --user/-t is common in dev/CI — not used for rank."
+    },
+    {
+      "id": "tier2_npm_postinstall",
+      "note": "npm postinstall hooks are ubiquitous — not used for rank."
+    },
+    {
+      "id": "tier2_docker_remote_fetch",
+      "note": "docker build curl is common — not used for rank."
+    }
+  ]
+}

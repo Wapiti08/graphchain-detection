@@ -52,6 +52,11 @@ def edge_attrs_for_export(ev: Event) -> Dict[str, Any]:
         ea["_ioc_type"] = pick_primary_ioc_type(types)
     elif isinstance(types, str) and types:
         ea["_ioc_type"] = str(types)
+    rule_types = ea.get("rule_ioc_types")
+    if isinstance(rule_types, list) and rule_types:
+        ea["_rule_ioc_type"] = pick_primary_ioc_type(rule_types)
+    elif isinstance(ea.get("_rule_ioc_type"), str) and str(ea.get("_rule_ioc_type")).strip():
+        ea["_rule_ioc_type"] = str(ea["_rule_ioc_type"]).strip()
     return ea
 
 
@@ -62,6 +67,16 @@ def primary_ioc_type_from_attrs(attrs: Dict[str, Any]) -> str:
     t = attrs.get("_ioc_type") or attrs.get("ioc_type")
     if isinstance(t, list) and t:
         return pick_primary_ioc_type(t)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return ""
+
+
+def primary_rule_ioc_type_from_attrs(attrs: Dict[str, Any]) -> str:
+    types = attrs.get("rule_ioc_types")
+    if isinstance(types, list) and types:
+        return pick_primary_ioc_type(types)
+    t = attrs.get("_rule_ioc_type")
     if isinstance(t, str) and t.strip():
         return t.strip()
     return ""

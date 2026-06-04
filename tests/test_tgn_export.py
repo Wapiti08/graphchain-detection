@@ -31,6 +31,7 @@ class TestTGNExport(unittest.TestCase):
         self.assertEqual(stream.t.ndim, 1)
         self.assertEqual(stream.etype.ndim, 1)
         self.assertEqual(stream.msg.ndim, 2)
+        self.assertEqual(stream.msg.size(-1), 27)
         self.assertEqual(stream.src.shape[0], stream.dst.shape[0])
         self.assertEqual(stream.src.shape[0], stream.t.shape[0])
         self.assertEqual(stream.src.shape[0], stream.etype.shape[0])
@@ -39,4 +40,3 @@ class TestTGNExport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
