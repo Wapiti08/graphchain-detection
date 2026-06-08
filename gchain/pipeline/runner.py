@@ -37,6 +37,7 @@ def cli_main(argv: Optional[List[str]] = None) -> None:
                 causal_window=float(args.causal_window),
                 export_tgn=bool(args.export_tgn),
                 skip_existing=bool(args.skip_existing),
+                weak_rules_relpath=str(args.weak_rules),
                 verbose=True,
             )
             return
@@ -51,6 +52,7 @@ def cli_main(argv: Optional[List[str]] = None) -> None:
             causal=args.causal,
             causal_window=float(args.causal_window),
             export_tgn=bool(args.export_tgn),
+            weak_rules_relpath=str(args.weak_rules),
             verbose=True,
         )
     except ValueError as e:

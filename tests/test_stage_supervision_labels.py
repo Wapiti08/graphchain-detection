@@ -53,5 +53,29 @@ class TestStageSupervisionLabels(unittest.TestCase):
         self.assertEqual(int(labels[1].item()), 0)
         self.assertEqual(int(labels[2].item()), 0)
 
+    def test_resolve_falls_back_rule_high_to_rule(self) -> None:
+        import torch
+
+        from gchain.eval.attack_reconstruct import ioc_type_to_stage_idx, load_ioc_type_to_stage
+        from gchain.train.modeling import resolve_stage_supervision
+
+        st = SimpleNamespace(
+            src=torch.zeros(2, dtype=torch.long),
+            rule_ioc_type=("attack_ip", "execution"),
+            y_rule_high=torch.tensor([1, 0], dtype=torch.long),
+            y_rule=torch.tensor([1, 1], dtype=torch.long),
+            ioc_type=("", ""),
+        )
+        mode, use_stage = resolve_stage_supervision(
+            streams={"sc1": st},
+            stage_supervision="rule_high",
+            repo_root=self._repo_root,
+            ioc_type_to_stage_idx=ioc_type_to_stage_idx,
+            load_stage_map=load_ioc_type_to_stage,
+        )
+        self.assertEqual(mode, "rule")
+        self.assertTrue(use_stage)
+
+
 if __name__ == "__main__":
     unittest.main()

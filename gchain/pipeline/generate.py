@@ -23,6 +23,7 @@ def _load_synthchain_events(
     scenario: str,
     only_ioc_logs: bool,
     limit_per_file: Optional[int],
+    weak_rules_relpath: str = "config/weak_supervision_rules.json",
 ) -> tuple[List[Event], str]:
     from parsers.synthchain import load_synthchain_events
 
@@ -31,6 +32,7 @@ def _load_synthchain_events(
         project_root=repo_root,
         only_ioc_logs=bool(only_ioc_logs),
         limit_per_file=limit_per_file,
+        weak_rules_path=weak_rules_relpath,
     )
     return events, f"synthchain_{scenario}"
 
@@ -119,6 +121,7 @@ def generate_graph(
     causal: str = "off",
     causal_window: float = 50.0,
     export_tgn: bool = False,
+    weak_rules_relpath: str = "config/weak_supervision_rules.json",
     verbose: bool = True,
 ) -> GenerateGraphResult:
     """
@@ -140,6 +143,7 @@ def generate_graph(
         scenario=scenario,
         only_ioc_logs=only_ioc_logs,
         limit_per_file=limit_per_file,
+        weak_rules_relpath=weak_rules_relpath,
     )
     stem = str(name).strip() or default_stem
     return _save_graph_artifacts(
@@ -164,6 +168,7 @@ def generate_synthchain_all_scenarios(
     causal_window: float = 50.0,
     export_tgn: bool = True,
     skip_existing: bool = False,
+    weak_rules_relpath: str = "config/weak_supervision_rules.json",
     verbose: bool = True,
 ) -> List[GenerateGraphResult]:
     """Batch-export SynthChain sc1..sc7 (or custom scenario list) .tgn.pt artifacts."""
@@ -188,6 +193,7 @@ def generate_synthchain_all_scenarios(
             scenario=sc,
             only_ioc_logs=only_ioc_logs,
             limit_per_file=limit_per_file,
+            weak_rules_relpath=weak_rules_relpath,
         )
         results.append(
             _save_graph_artifacts(

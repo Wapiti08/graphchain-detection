@@ -69,4 +69,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Also export a flattened TGN-style event stream (.tgn.pt).",
     )
+    p.add_argument(
+        "--weak-rules",
+        type=str,
+        default="config/weak_supervision_rules.json",
+        help="Weak-supervision rules JSON (repo-relative), e.g. config/weak_supervision_rules_update_ablation.json.",
+    )
     return p.parse_args(argv)

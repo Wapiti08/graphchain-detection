@@ -177,6 +177,97 @@ def count_stage_eligible_rule_labels(
     return int(((labels > 0) & (y_mask > 0)).sum().item())
 
 
+def _stage_eligible_counts_per_scenario(
+    streams: Dict[str, "object"],
+    *,
+    stage_supervision: str,
+    repo_root: "object",
+    ioc_type_to_stage_idx: "object",
+    load_stage_map: "object",
+) -> Dict[str, int]:
+    mode = str(stage_supervision or "gt_ioc").strip().lower()
+    labels_per_sc = build_stage_labels(
+        streams=streams,
+        repo_root=repo_root,
+        ioc_type_to_stage_idx=ioc_type_to_stage_idx,
+        load_stage_map=load_stage_map,
+        stage_supervision=mode,
+    )
+    out: Dict[str, int] = {}
+    for sc, labels in labels_per_sc.items():
+        out[sc] = count_stage_eligible_rule_labels(
+            streams[sc], labels, stage_supervision=mode
+        )
+    return out
+
+
+def resolve_stage_supervision(
+    streams: Dict[str, "object"],
+    *,
+    stage_supervision: str,
+    repo_root: "object",
+    ioc_type_to_stage_idx: "object",
+    load_stage_map: "object",
+) -> Tuple[str, bool]:
+    """
+    Pick an effective stage supervision mode for training.
+
+    For weak-rule modes, network IOC types (attack_ip, suspicious_port, …) are excluded
+    from stage CE. When ``rule_high`` yields zero stage-eligible labels (common on sc1
+    where high-confidence hits are mostly CONNECT/alert-shaped), fall back to ``rule``
+    (medium+high). If still zero, disable the stage head and train SSL-only.
+    """
+    import sys
+
+    mode = str(stage_supervision or "gt_ioc").strip().lower()
+    if mode not in {"rule", "rule_high"}:
+        return mode, True
+
+    counts = _stage_eligible_counts_per_scenario(
+        streams,
+        stage_supervision=mode,
+        repo_root=repo_root,
+        ioc_type_to_stage_idx=ioc_type_to_stage_idx,
+        load_stage_map=load_stage_map,
+    )
+    if all(n > 0 for n in counts.values()):
+        return mode, True
+
+    for sc, n in sorted(counts.items()):
+        if n == 0:
+            print(
+                f"[{sc}] No stage-eligible {mode} labels after supervision_policy "
+                "(network IOC types excluded from stage CE).",
+                file=sys.stderr,
+            )
+
+    if mode == "rule_high":
+        rule_counts = _stage_eligible_counts_per_scenario(
+            streams,
+            stage_supervision="rule",
+            repo_root=repo_root,
+            ioc_type_to_stage_idx=ioc_type_to_stage_idx,
+            load_stage_map=load_stage_map,
+        )
+        if any(n > 0 for n in rule_counts.values()):
+            for sc, n in sorted(rule_counts.items()):
+                if n > 0:
+                    print(
+                        f"[{sc}] Falling back to stage_supervision=rule "
+                        f"({n} stage-eligible weak-rule labels).",
+                        file=sys.stderr,
+                    )
+            return "rule", True
+
+    print(
+        "[train] Disabling stage head (lambda_stage ignored): no stage-eligible weak-rule "
+        "labels for rule or rule_high. SSL link detection will still train. "
+        "Use --lambda-stage 0 to silence this, or --stage-supervision gt_ioc for ablations.",
+        file=sys.stderr,
+    )
+    return mode, False
+
+
 def validate_stage_supervision_streams(
     streams: Dict[str, "object"],
     *,
@@ -185,23 +276,15 @@ def validate_stage_supervision_streams(
     ioc_type_to_stage_idx: "object",
     load_stage_map: "object",
 ) -> None:
-    """Fail fast when no stage-eligible weak-rule labels exist (network-only rules excluded)."""
-    mode = str(stage_supervision or "gt_ioc").strip().lower()
-    if mode not in {"rule", "rule_high"}:
-        return
-    labels_per_sc = build_stage_labels(
-        streams=streams,
+    """Backward-compatible strict check (prefer resolve_stage_supervision in train_loop)."""
+    _, use_stage = resolve_stage_supervision(
+        streams,
+        stage_supervision=stage_supervision,
         repo_root=repo_root,
         ioc_type_to_stage_idx=ioc_type_to_stage_idx,
         load_stage_map=load_stage_map,
-        stage_supervision=mode,
     )
-    for sc, labels in labels_per_sc.items():
-        st = streams[sc]
-        n_pos = count_stage_eligible_rule_labels(st, labels, stage_supervision=mode)
-        if n_pos == 0:
-            raise SystemExit(
-                f"[{sc}] No stage-eligible {mode} labels after supervision_policy "
-                "(network IOC types excluded from stage CE). "
-                "Use --lambda-stage 0, or add process/cmd rule hits, or --stage-supervision gt_ioc for ablations."
-            )
+    if not use_stage and str(stage_supervision or "").strip().lower() in {"rule", "rule_high"}:
+        raise SystemExit(
+            "No stage-eligible weak-rule labels. See resolve_stage_supervision warnings above."
+        )

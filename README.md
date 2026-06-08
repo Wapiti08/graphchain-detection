@@ -180,6 +180,24 @@ Weak-rule **ranking** ablation: `bash scripts/run_per_scenario_weak_rule.sh`.
 | Script (deploy) | `scripts/run_per_scenario_rule_stage.sh` | **link + rule stage**, no rank loss |
 | Tests | `tests/test_weak_supervision_rules.py` | rule v2 policy tests |
 
+### Rules-update ablation (extensibility demo)
+
+Simulates analyst-added weak rule `tier2_staging_path_download` (curl/wget staging under `/dev/shm` or `/tmp`), then compares coverage and per-scenario train metrics:
+
+```bash
+# fast: rule_hit / rule_high deltas on sc1..sc7 (no GPU)
+STATS_ONLY=1 bash scripts/run_rules_update_ablation.sh
+
+# full: re-export graphs + train sc1,sc3,sc5 (default 5 epochs, cpu)
+bash scripts/run_rules_update_ablation.sh
+
+# outputs under artifacts/rules_update_ablation/
+#   rule_coverage_compare.csv
+#   train_regression_compare.csv
+```
+
+Pipeline accepts alternate rules: `--weak-rules config/weak_supervision_rules_update_ablation.json`.
+
 ## Quick Running
 ```
 python -m gchain.pipeline --dataset synthchain --scenario sc1
@@ -230,5 +248,8 @@ python scripts/eval_attack_reconstruction.py \
 python scripts/merge_attack_reconstruction_summaries.py \
   --pattern "per_scenario_*" \
   --out-csv artifacts/tgn_runs/per_scenario_reconstruction_summary.csv
+
+# quantitative main table (detection + reconstruction + latency; see scripts/benchmarks/README.md)
+bash scripts/benchmarks/run_main_table.sh
 
 ```

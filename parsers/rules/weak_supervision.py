@@ -13,13 +13,27 @@ from graphcore.edge_meta import pick_primary_ioc_type
 from parsers.events import Event
 
 
+DEFAULT_WEAK_RULES_RELPATH = "config/weak_supervision_rules.json"
+
+
+def _resolve_rules_path(project_root: Path, rules_relpath: str) -> Path:
+    rel = str(rules_relpath or DEFAULT_WEAK_RULES_RELPATH).strip() or DEFAULT_WEAK_RULES_RELPATH
+    path = Path(rel)
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve()
+
+
 def _repo_rules_path(project_root: Path) -> Path:
-    return project_root / "config" / "weak_supervision_rules.json"
+    return _resolve_rules_path(project_root, DEFAULT_WEAK_RULES_RELPATH)
 
 
-@lru_cache(maxsize=4)
-def load_weak_supervision_rules(project_root: str) -> Dict[str, Any]:
-    path = _repo_rules_path(Path(project_root))
+@lru_cache(maxsize=16)
+def load_weak_supervision_rules(
+    project_root: str,
+    rules_relpath: str = DEFAULT_WEAK_RULES_RELPATH,
+) -> Dict[str, Any]:
+    path = _resolve_rules_path(Path(project_root), rules_relpath)
     if not path.is_file():
         raise FileNotFoundError(f"Missing weak supervision config: {path}")
     return json.loads(path.read_text(encoding="utf-8"))

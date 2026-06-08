@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 import pandas as pd
 
 from config.synthchain_sources import SYNTHCHAIN_IOC_CONFIG
+from config.telemetry_family import TelemetryFamily, log_name_in_family, normalize_telemetry_family
 from parsers.events import Event
 from parsers.azure import (
     parse_azure_conn_df,
@@ -35,6 +36,7 @@ def load_synthchain_events(
     limit_per_file: Optional[int] = None,
     ioc_ground_truth_path: str | Path | None = "data/SynthChain/iocs/ioc_ground_truth.json",
     *,
+    telemetry_family: str = "full",
     annotate_weak_rules: bool = True,
     weak_rules_path: str | Path | None = "config/weak_supervision_rules.json",
     verbose: bool = False,
@@ -44,6 +46,7 @@ def load_synthchain_events(
 
     - `only_ioc_logs=True` will ignore files marked as has_ioc=False (noise control).
     - `limit_per_file` is useful for quick experiments.
+    - `telemetry_family`: ``full`` | ``audit`` (AE/AP/AC/AS) | ``zeek`` | ``eve`` (IDS).
     """
     if scenario_id not in SYNTHCHAIN_IOC_CONFIG:
         raise KeyError(f"Unknown scenario_id: {scenario_id}")
@@ -51,15 +54,18 @@ def load_synthchain_events(
     cfg = SYNTHCHAIN_IOC_CONFIG[scenario_id]
     base = Path(project_root) / cfg["root"]
     out: List[Event] = []
+    family: TelemetryFamily = normalize_telemetry_family(telemetry_family)
 
     debug = bool(verbose) or str(os.environ.get("SYNTHCHAIN_DEBUG_LOAD") or "").strip() in {"1", "true", "yes", "y"}
     if debug:
         print(
             f"[load_synthchain_events] scenario={scenario_id} base={base} "
-            f"only_ioc_logs={only_ioc_logs} limit_per_file={limit_per_file}"
+            f"only_ioc_logs={only_ioc_logs} telemetry_family={family} limit_per_file={limit_per_file}"
         )
 
     for log_name, spec in cfg["logs"].items():
+        if not log_name_in_family(log_name, family):
+            continue
         if only_ioc_logs and not spec.get("has_ioc", False):
             continue
 
@@ -157,7 +163,8 @@ def load_synthchain_events(
                 load_weak_supervision_rules,
             )
 
-            rules = load_weak_supervision_rules(str(project_root))
+            rules_relpath = str(weak_rules_path or "config/weak_supervision_rules.json")
+            rules = load_weak_supervision_rules(str(project_root), rules_relpath)
             src_map = ioc_log_source_map_for_scenario(scenario_id, Path(project_root))
             if debug:
                 print(f"[load_synthchain_events] annotate_events_with_weak_rules input_events={len(out)}")

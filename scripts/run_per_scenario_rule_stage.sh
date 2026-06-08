@@ -7,6 +7,8 @@
 #   - Report by_k_pred_stage (and by_k_group_cap_adaptive) in summary CSV
 #
 # Prerequisite: graphs with weak rules v2 (rule_ioc_type, y_rule_high in *.tgn.pt)
+# sc1 note: rule_high may be network-only (no stage CE); train_loop auto-falls back to
+# stage_supervision=rule, or SSL-only if still zero. Diagnose: scripts/diagnose_stage_supervision.py
 #
 # Usage:
 #   REGEN_GRAPH=1 EPOCHS=20 DEVICE=cuda bash scripts/run_per_scenario_rule_stage.sh all

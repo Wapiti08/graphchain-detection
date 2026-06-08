@@ -23,7 +23,7 @@ from gchain.train.modeling import (
     build_stage_labels,
     freeze_ssl_backbone,
     load_training_checkpoint,
-    validate_stage_supervision_streams,
+    resolve_stage_supervision,
 )
 from gchain.train.neg_sampling import build_neg_pools, build_time_pools, inbatch_neg_dst, sample_window_neg_dst
 from gchain.train.split import time_split_idx
@@ -147,7 +147,7 @@ def train(
     use_stage = float(args.lambda_stage) > 0.0
     stage_supervision = str(getattr(args, "stage_supervision", "gt_ioc"))
     if use_stage:
-        validate_stage_supervision_streams(
+        stage_supervision, use_stage = resolve_stage_supervision(
             streams,
             stage_supervision=stage_supervision,
             repo_root=repo_root,
