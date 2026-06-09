@@ -162,24 +162,6 @@ python scripts/train_tgn_synthchain.py --scenarios sc4 \
 Primary SSL + adaptive recon (research baseline) remains `bash scripts/run_per_scenario_ssl_recon.sh`.
 Weak-rule **ranking** ablation: `bash scripts/run_per_scenario_weak_rule.sh`.
 
-### Code map (what was added/changed)
-
-| Area | Path | Change |
-|------|------|--------|
-| Rules | `config/weak_supervision_rules.json` | v2 rank_policy; benign install cmd excluded from rank |
-| Annotate | `parsers/rules/weak_supervision.py` | `infer_rule_hits_for_event`, `annotate_events_with_weak_rules` |
-| Parser hook | `parsers/synthchain/event_parsers.py` | `annotate_weak_rules=True` on load |
-| TGN export | `graphcore/tgn_input.py`, `graphcore/edge_meta.py` | `y_rule`, `y_rule_high`, `rule_ioc_type` in `.tgn.pt` |
-| Pipeline | `gchain/pipeline/generate.py` | save `rule_ioc_type` in blob |
-| Train CLI | `gchain/train/args_common.py` | `--stage-supervision`, `--rank-supervision` |
-| Stage labels | `gchain/train/modeling.py` | `build_stage_labels(..., stage_supervision=rule_high)` |
-| Streams | `gchain/train/streams.py` | load `rule_ioc_type` from `.tgn.pt` |
-| Train loop | `gchain/train/train_loop.py` | stage CE + `lambda_stage_none` for deployable masks |
-| Rank aux | `gchain/train/supervision.py` | `rank_supervision_tensor()` |
-| Script (rank ablation) | `scripts/run_per_scenario_weak_rule.sh` | rule rank + adaptive recon |
-| Script (deploy) | `scripts/run_per_scenario_rule_stage.sh` | **link + rule stage**, no rank loss |
-| Tests | `tests/test_weak_supervision_rules.py` | rule v2 policy tests |
-
 ### Rules-update ablation (extensibility demo)
 
 Simulates analyst-added weak rule `tier2_staging_path_download` (curl/wget staging under `/dev/shm` or `/tmp`), then compares coverage and per-scenario train metrics:
